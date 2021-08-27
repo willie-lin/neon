@@ -16,7 +16,7 @@
 //! into the ImageLayerInner struct. See load() and unload() functions.
 //! TODO: That's very inefficient, we should be smarter.
 //!
-use crate::layered_repository::filename::ImageFileName;
+use crate::layered_repository::filename::{ImageFileName, PathOrConf};
 use crate::layered_repository::storage_layer::{Layer, PageReconstructData, SegmentTag};
 use crate::layered_repository::LayeredTimeline;
 use crate::layered_repository::RELISH_SEG_SIZE;
@@ -28,7 +28,7 @@ use log::*;
 use std::fs;
 use std::fs::File;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 use bookfile::{Book, BookWriter};
@@ -49,7 +49,7 @@ static BASE_IMAGES_CHAPTER: u64 = 1;
 /// and it needs to be loaded before using it in queries.
 ///
 pub struct ImageLayer {
-    conf: &'static PageServerConf,
+    path_or_conf: PathOrConf,
     pub tenantid: ZTenantId,
     pub timelineid: ZTimelineId,
     pub seg: SegmentTag,
@@ -167,12 +167,24 @@ impl Layer for ImageLayer {
     fn is_incremental(&self) -> bool {
         false
     }
+
+    /// debugging function to print out the contents of the layer
+    fn dump(&self) -> Result<()> {
+        // Layer::dump() is currently only used by the 'dump_snapfile' binary, so
+        // this InMemoryLayer implementation is currently never used.
+        println!("----- image layer for {} at {} ----", self.seg, self.lsn);
+
+        let inner = self.load()?;
+        println!("{} blocks", inner.base_images.len());
+
+        Ok(())
+    }
 }
 
 impl ImageLayer {
     fn path(&self) -> PathBuf {
         Self::path_for(
-            self.conf,
+            &self.path_or_conf,
             self.timelineid,
             self.tenantid,
             &ImageFileName {
@@ -183,13 +195,17 @@ impl ImageLayer {
     }
 
     fn path_for(
-        conf: &'static PageServerConf,
+        path_or_conf: &PathOrConf,
         timelineid: ZTimelineId,
         tenantid: ZTenantId,
         fname: &ImageFileName,
     ) -> PathBuf {
-        conf.timeline_path(&timelineid, &tenantid)
-            .join(fname.to_string())
+        match path_or_conf {
+            PathOrConf::Path(path) => path.to_path_buf(),
+            PathOrConf::Conf(conf) => conf
+                .timeline_path(&timelineid, &tenantid)
+                .join(fname.to_string()),
+        }
     }
 
     /// Create a new image file, using the given array of pages.
@@ -202,7 +218,7 @@ impl ImageLayer {
         base_images: Vec<Bytes>,
     ) -> Result<ImageLayer> {
         let layer = ImageLayer {
-            conf: conf,
+            path_or_conf: PathOrConf::Conf(conf),
             timelineid: timelineid,
             tenantid: tenantid,
             seg: seg,
@@ -287,7 +303,7 @@ impl ImageLayer {
         }
 
         let path = Self::path_for(
-            self.conf,
+            &self.path_or_conf,
             self.timelineid,
             self.tenantid,
             &ImageFileName {
@@ -320,7 +336,7 @@ impl ImageLayer {
         filename: &ImageFileName,
     ) -> ImageLayer {
         ImageLayer {
-            conf,
+            path_or_conf: PathOrConf::Conf(conf),
             timelineid,
             tenantid,
             seg: filename.seg,
@@ -332,17 +348,27 @@ impl ImageLayer {
         }
     }
 
-    /// debugging function to print out the contents of the layer
-    #[allow(unused)]
-    pub fn dump(&self) -> String {
-        let mut result = format!("----- image layer for {} at {} ----\n", self.seg, self.lsn);
+    /// Create an ImageLayer struct representing an existing file on disk.
+    ///
+    /// This variant is only used for debugging purposes, by the 'dump_snapfile' binary.
+    pub fn new_for_path(
+        path: &Path,
+        timelineid: ZTimelineId,
+        tenantid: ZTenantId,
+        filename: &ImageFileName,
+    ) -> ImageLayer {
+        let path_static = Box::leak(Box::new(path.to_path_buf()));
 
-        //let inner = self.inner.lock().unwrap();
-
-        //for (k, v) in inner.page_versions.iter() {
-        //    result += &format!("blk {} at {}: {}/{}\n", k.0, k.1, v.page_image.is_some(), v.record.is_some());
-        //}
-
-        result
+        ImageLayer {
+            path_or_conf: PathOrConf::Path(path_static),
+            timelineid,
+            tenantid,
+            seg: filename.seg,
+            lsn: filename.lsn,
+            inner: Mutex::new(ImageLayerInner {
+                loaded: false,
+                base_images: Vec::new(),
+            }),
+        }
     }
 }
