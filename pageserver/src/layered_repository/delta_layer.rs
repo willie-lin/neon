@@ -38,6 +38,7 @@ use crate::layered_repository::filename::{DeltaFileName, PathOrConf};
 use crate::layered_repository::storage_layer::{
     Layer, PageReconstructData, PageVersion, SegmentTag,
 };
+use crate::waldecoder;
 use crate::PageServerConf;
 use crate::{ZTenantId, ZTimelineId};
 use anyhow::{bail, Result};
@@ -270,6 +271,8 @@ impl Layer for DeltaLayer {
             }
             if let Some(rec) = &v.record {
                 desc += &format!(" rec {} bytes will_init: {}", rec.rec.len(), rec.will_init);
+                desc += " ";
+                desc += &waldecoder::describe_wal_record(&rec.rec);
             }
             println!("  blk {} at {}: {}", k.0, k.1, desc);
         }
