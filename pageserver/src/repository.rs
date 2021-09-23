@@ -130,7 +130,7 @@ pub trait Timeline: Send + Sync {
     fn put_wal_record(&self, tag: RelishTag, blknum: u32, rec: &WALRecord) -> Result<()>;
 
     /// Like put_wal_record, but with ready-made image of the page.
-    fn put_page_image(&self, tag: RelishTag, blknum: u32, lsn: Lsn, img: Bytes) -> Result<()>;
+    fn put_page_image(&self, tag: RelishTag, blknum: u32, lsn: Lsn, img: &[u8]) -> Result<()>;
 
     /// Truncate relation
     fn put_truncation(&self, rel: RelishTag, lsn: Lsn, nblocks: u32) -> Result<()>;
@@ -234,12 +234,12 @@ mod tests {
 
     /// Convenience function to create a page image with given string as the only content
     #[allow(non_snake_case)]
-    fn TEST_IMG(s: &str) -> Bytes {
+    fn TEST_IMG(s: &str) -> Vec<u8> {
         let mut buf = BytesMut::new();
         buf.extend_from_slice(s.as_bytes());
         buf.resize(8192, 0);
 
-        buf.freeze()
+        buf.to_vec()
     }
 
     fn assert_current_logical_size(timeline: &Arc<dyn Timeline>, lsn: Lsn) {
@@ -287,11 +287,11 @@ mod tests {
         let timelineid = ZTimelineId::from_str("11223344556677881122334455667788").unwrap();
         let tline = repo.create_empty_timeline(timelineid)?;
 
-        tline.put_page_image(TESTREL_A, 0, Lsn(0x20), TEST_IMG("foo blk 0 at 2"))?;
-        tline.put_page_image(TESTREL_A, 0, Lsn(0x20), TEST_IMG("foo blk 0 at 2"))?;
-        tline.put_page_image(TESTREL_A, 0, Lsn(0x30), TEST_IMG("foo blk 0 at 3"))?;
-        tline.put_page_image(TESTREL_A, 1, Lsn(0x40), TEST_IMG("foo blk 1 at 4"))?;
-        tline.put_page_image(TESTREL_A, 2, Lsn(0x50), TEST_IMG("foo blk 2 at 5"))?;
+        tline.put_page_image(TESTREL_A, 0, Lsn(0x20), &TEST_IMG("foo blk 0 at 2"))?;
+        tline.put_page_image(TESTREL_A, 0, Lsn(0x20), &TEST_IMG("foo blk 0 at 2"))?;
+        tline.put_page_image(TESTREL_A, 0, Lsn(0x30), &TEST_IMG("foo blk 0 at 3"))?;
+        tline.put_page_image(TESTREL_A, 1, Lsn(0x40), &TEST_IMG("foo blk 1 at 4"))?;
+        tline.put_page_image(TESTREL_A, 2, Lsn(0x50), &TEST_IMG("foo blk 2 at 5"))?;
 
         tline.advance_last_record_lsn(Lsn(0x50));
 
@@ -367,7 +367,7 @@ mod tests {
         assert_eq!(tline.get_relish_size(TESTREL_A, Lsn(0x68))?.unwrap(), 0);
 
         // Extend from 0 to 2 blocks, leaving a gap
-        tline.put_page_image(TESTREL_A, 1, Lsn(0x70), TEST_IMG("foo blk 1"))?;
+        tline.put_page_image(TESTREL_A, 1, Lsn(0x70), &TEST_IMG("foo blk 1"))?;
         tline.advance_last_record_lsn(Lsn(0x70));
         assert_eq!(tline.get_relish_size(TESTREL_A, Lsn(0x70))?.unwrap(), 2);
         assert_eq!(tline.get_page_at_lsn(TESTREL_A, 0, Lsn(0x70))?, ZERO_PAGE);
@@ -379,7 +379,7 @@ mod tests {
         // Extend a lot more, leaving a big gap that spans across segments
         // FIXME: This is currently broken, see https://github.com/zenithdb/zenith/issues/500
         /*
-        tline.put_page_image(TESTREL_A, 1500, Lsn(0x80), TEST_IMG("foo blk 1500"))?;
+        tline.put_page_image(TESTREL_A, 1500, Lsn(0x80), &TEST_IMG("foo blk 1500"))?;
         tline.advance_last_record_lsn(Lsn(0x80));
         assert_eq!(tline.get_relish_size(TESTREL_A, Lsn(0x80))?.unwrap(), 1501);
         for blk in 2..1500 {
@@ -405,7 +405,7 @@ mod tests {
         let timelineid = ZTimelineId::from_str("11223344556677881122334455667788").unwrap();
         let tline = repo.create_empty_timeline(timelineid)?;
 
-        tline.put_page_image(TESTREL_A, 0, Lsn(0x20), TEST_IMG("foo blk 0 at 2"))?;
+        tline.put_page_image(TESTREL_A, 0, Lsn(0x20), &TEST_IMG("foo blk 0 at 2"))?;
         tline.advance_last_record_lsn(Lsn(0x20));
 
         // Check that rel exists and size is correct
@@ -421,7 +421,7 @@ mod tests {
         assert!(tline.get_relish_size(TESTREL_A, Lsn(0x30))?.is_none());
 
         // Extend it again
-        tline.put_page_image(TESTREL_A, 0, Lsn(0x40), TEST_IMG("foo blk 0 at 4"))?;
+        tline.put_page_image(TESTREL_A, 0, Lsn(0x40), &TEST_IMG("foo blk 0 at 4"))?;
         tline.advance_last_record_lsn(Lsn(0x40));
 
         // Check that rel exists and size is correct
@@ -450,7 +450,7 @@ mod tests {
         for blkno in 0..relsize {
             let lsn = Lsn(0x20);
             let data = format!("foo blk {} at {}", blkno, lsn);
-            tline.put_page_image(TESTREL_A, blkno, lsn, TEST_IMG(&data))?;
+            tline.put_page_image(TESTREL_A, blkno, lsn, &TEST_IMG(&data))?;
         }
 
         tline.advance_last_record_lsn(Lsn(0x20));
@@ -471,7 +471,7 @@ mod tests {
             let data = format!("foo blk {} at {}", blkno, lsn);
             assert_eq!(
                 tline.get_page_at_lsn(TESTREL_A, blkno, lsn)?,
-                TEST_IMG(&data)
+                &TEST_IMG(&data)
             );
         }
 
@@ -488,7 +488,7 @@ mod tests {
             let data = format!("foo blk {} at {}", blkno, lsn);
             assert_eq!(
                 tline.get_page_at_lsn(TESTREL_A, blkno, Lsn(0x60))?,
-                TEST_IMG(&data)
+                &TEST_IMG(&data)
             );
         }
 
@@ -502,7 +502,7 @@ mod tests {
             let data = format!("foo blk {} at {}", blkno, lsn);
             assert_eq!(
                 tline.get_page_at_lsn(TESTREL_A, blkno, Lsn(0x50))?,
-                TEST_IMG(&data)
+                &TEST_IMG(&data)
             );
         }
 
@@ -511,7 +511,7 @@ mod tests {
         for blkno in 0..relsize {
             let lsn = Lsn(0x80);
             let data = format!("foo blk {} at {}", blkno, lsn);
-            tline.put_page_image(TESTREL_A, blkno, lsn, TEST_IMG(&data))?;
+            tline.put_page_image(TESTREL_A, blkno, lsn, &TEST_IMG(&data))?;
         }
         tline.advance_last_record_lsn(Lsn(0x80));
 
@@ -526,7 +526,7 @@ mod tests {
             let data = format!("foo blk {} at {}", blkno, lsn);
             assert_eq!(
                 tline.get_page_at_lsn(TESTREL_A, blkno, Lsn(0x80))?,
-                TEST_IMG(&data)
+                &TEST_IMG(&data)
             );
         }
 
@@ -545,7 +545,7 @@ mod tests {
         for blknum in 0..pg_constants::RELSEG_SIZE + 1 {
             let img = TEST_IMG(&format!("foo blk {} at {}", blknum, Lsn(lsn)));
             lsn += 0x10;
-            tline.put_page_image(TESTREL_A, blknum as u32, Lsn(lsn), img)?;
+            tline.put_page_image(TESTREL_A, blknum as u32, Lsn(lsn), &img)?;
         }
         tline.advance_last_record_lsn(Lsn(lsn));
 
@@ -607,10 +607,10 @@ mod tests {
 
         // Import initial dummy checkpoint record, otherwise the get_timeline() call
         // after branching fails below
-        tline.put_page_image(RelishTag::Checkpoint, 0, Lsn(0x10), ZERO_CHECKPOINT.clone())?;
+        tline.put_page_image(RelishTag::Checkpoint, 0, Lsn(0x10), &ZERO_CHECKPOINT)?;
 
         // Create a relation on the timeline
-        tline.put_page_image(TESTREL_A, 0, Lsn(0x20), TEST_IMG("foo blk 0 at 2"))?;
+        tline.put_page_image(TESTREL_A, 0, Lsn(0x20), &TEST_IMG("foo blk 0 at 2"))?;
 
         tline.advance_last_record_lsn(Lsn(0x30));
 
@@ -662,15 +662,15 @@ mod tests {
 
         // Import initial dummy checkpoint record, otherwise the get_timeline() call
         // after branching fails below
-        tline.put_page_image(RelishTag::Checkpoint, 0, Lsn(0x10), ZERO_CHECKPOINT.clone())?;
+        tline.put_page_image(RelishTag::Checkpoint, 0, Lsn(0x10), &ZERO_CHECKPOINT)?;
 
         // Create a relation on the timeline
-        tline.put_page_image(TESTREL_A, 0, Lsn(0x20), TEST_IMG("foo blk 0 at 2"))?;
-        tline.put_page_image(TESTREL_A, 0, Lsn(0x30), TEST_IMG("foo blk 0 at 3"))?;
-        tline.put_page_image(TESTREL_A, 0, Lsn(0x40), TEST_IMG("foo blk 0 at 4"))?;
+        tline.put_page_image(TESTREL_A, 0, Lsn(0x20), &TEST_IMG("foo blk 0 at 2"))?;
+        tline.put_page_image(TESTREL_A, 0, Lsn(0x30), &TEST_IMG("foo blk 0 at 3"))?;
+        tline.put_page_image(TESTREL_A, 0, Lsn(0x40), &TEST_IMG("foo blk 0 at 4"))?;
 
         // Create another relation
-        tline.put_page_image(TESTREL_B, 0, Lsn(0x20), TEST_IMG("foobar blk 0 at 2"))?;
+        tline.put_page_image(TESTREL_B, 0, Lsn(0x20), &TEST_IMG("foobar blk 0 at 2"))?;
 
         tline.advance_last_record_lsn(Lsn(0x40));
         assert_current_logical_size(&tline, Lsn(0x40));
@@ -680,23 +680,23 @@ mod tests {
         repo.branch_timeline(timelineid, newtimelineid, Lsn(0x30))?;
         let newtline = repo.get_timeline(newtimelineid)?;
 
-        newtline.put_page_image(TESTREL_A, 0, Lsn(0x40), TEST_IMG("bar blk 0 at 4"))?;
+        newtline.put_page_image(TESTREL_A, 0, Lsn(0x40), &TEST_IMG("bar blk 0 at 4"))?;
         newtline.advance_last_record_lsn(Lsn(0x40));
 
         // Check page contents on both branches
         assert_eq!(
             tline.get_page_at_lsn(TESTREL_A, 0, Lsn(0x40))?,
-            TEST_IMG("foo blk 0 at 4")
+            &TEST_IMG("foo blk 0 at 4")
         );
 
         assert_eq!(
             newtline.get_page_at_lsn(TESTREL_A, 0, Lsn(0x40))?,
-            TEST_IMG("bar blk 0 at 4")
+            &TEST_IMG("bar blk 0 at 4")
         );
 
         assert_eq!(
             newtline.get_page_at_lsn(TESTREL_B, 0, Lsn(0x40))?,
-            TEST_IMG("foobar blk 0 at 2")
+            &TEST_IMG("foobar blk 0 at 2")
         );
 
         assert_eq!(newtline.get_relish_size(TESTREL_B, Lsn(0x40))?.unwrap(), 1);
@@ -731,7 +731,7 @@ mod tests {
                 records.len()
             );
             println!("{}", s);
-            Ok(TEST_IMG(&s))
+            Ok(Bytes::copy_from_slice(&TEST_IMG(&s)))
         }
     }
 }

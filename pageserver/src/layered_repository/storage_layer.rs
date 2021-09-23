@@ -66,7 +66,7 @@ impl SegmentTag {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PageVersion {
     /// an 8kb page image
-    pub page_image: Option<Bytes>,
+    pub page_image: Option<Vec<u8>>,
     /// WAL record to get from previous page version to this one.
     pub record: Option<WALRecord>,
 }

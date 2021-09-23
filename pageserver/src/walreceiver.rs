@@ -219,7 +219,7 @@ fn walreceiver_main(
                             RelishTag::Checkpoint,
                             0,
                             lsn,
-                            new_checkpoint_bytes,
+                            &new_checkpoint_bytes,
                         )?;
                     }
 

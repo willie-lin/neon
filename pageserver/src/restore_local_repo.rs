@@ -27,7 +27,7 @@ use zenith_utils::lsn::Lsn;
 const MAX_MBR_BLKNO: u32 =
     pg_constants::MAX_MULTIXACT_ID / pg_constants::MULTIXACT_MEMBERS_PER_PAGE as u32;
 
-static ZERO_PAGE: Bytes = Bytes::from_static(&[0u8; 8192]);
+static ZERO_PAGE: [u8; 8192] = [0u8; 8192];
 
 ///
 /// Import all relation data pages from local disk into the repository.
@@ -162,7 +162,7 @@ fn import_relfile(
                     forknum,
                 };
                 let tag = RelishTag::Relation(rel);
-                timeline.put_page_image(tag, blknum, lsn, Bytes::copy_from_slice(&buf))?;
+                timeline.put_page_image(tag, blknum, lsn, &buf)?;
             }
 
             // TODO: UnexpectedEof is expected
@@ -203,7 +203,7 @@ fn import_nonrel_file(
 
     info!("importing non-rel file {}", path.display());
 
-    timeline.put_page_image(tag, 0, lsn, Bytes::copy_from_slice(&buffer[..]))?;
+    timeline.put_page_image(tag, 0, lsn, &buffer[..])?;
     Ok(())
 }
 
@@ -225,13 +225,13 @@ fn import_control_file(timeline: &dyn Timeline, lsn: Lsn, path: &Path) -> Result
         RelishTag::ControlFile,
         0,
         lsn,
-        Bytes::copy_from_slice(&buffer[..]),
+        &buffer[..],
     )?;
 
     // Extract the checkpoint record and import it separately.
     let pg_control = ControlFileData::decode(&buffer)?;
     let checkpoint_bytes = pg_control.checkPointCopy.encode();
-    timeline.put_page_image(RelishTag::Checkpoint, 0, lsn, checkpoint_bytes)?;
+    timeline.put_page_image(RelishTag::Checkpoint, 0, lsn, &checkpoint_bytes)?;
 
     Ok(())
 }
@@ -256,7 +256,7 @@ fn import_slru_file(timeline: &dyn Timeline, lsn: Lsn, slru: SlruKind, path: &Pa
                     RelishTag::Slru { slru, segno },
                     rpageno,
                     lsn,
-                    Bytes::copy_from_slice(&buf),
+                    &buf,
                 )?;
             }
 
@@ -371,7 +371,7 @@ pub fn save_decoded_record(
                 },
                 rpageno,
                 lsn,
-                ZERO_PAGE.clone(),
+                &ZERO_PAGE,
             )?;
         } else {
             assert!(info == pg_constants::CLOG_TRUNCATE);
@@ -411,7 +411,7 @@ pub fn save_decoded_record(
                 },
                 0,
                 lsn,
-                Bytes::copy_from_slice(&buf[..]),
+                &buf[..],
             )?;
         }
     } else if decoded.xl_rmid == pg_constants::RM_MULTIXACT_ID {
@@ -428,7 +428,7 @@ pub fn save_decoded_record(
                 },
                 rpageno,
                 lsn,
-                ZERO_PAGE.clone(),
+                &ZERO_PAGE,
             )?;
         } else if info == pg_constants::XLOG_MULTIXACT_ZERO_MEM_PAGE {
             let pageno = buf.get_u32_le();
@@ -441,7 +441,7 @@ pub fn save_decoded_record(
                 },
                 rpageno,
                 lsn,
-                ZERO_PAGE.clone(),
+                &ZERO_PAGE,
             )?;
         } else if info == pg_constants::XLOG_MULTIXACT_CREATE_ID {
             let xlrec = XlMultiXactCreate::decode(&mut buf);
@@ -518,7 +518,7 @@ fn save_xlog_dbase_create(timeline: &dyn Timeline, lsn: Lsn, rec: &XlCreateDatab
 
                 debug!("copying block {} from {} to {}", blknum, src_rel, dst_rel);
 
-                timeline.put_page_image(RelishTag::Relation(dst_rel), blknum, lsn, content)?;
+                timeline.put_page_image(RelishTag::Relation(dst_rel), blknum, lsn, &content)?;
                 num_blocks_copied += 1;
             }
 
@@ -542,7 +542,7 @@ fn save_xlog_dbase_create(timeline: &dyn Timeline, lsn: Lsn, rec: &XlCreateDatab
                     spcnode: tablespace_id,
                     dbnode: db_id,
                 };
-                timeline.put_page_image(new_tag, 0, lsn, img)?;
+                timeline.put_page_image(new_tag, 0, lsn, &img)?;
                 break;
             }
         }
@@ -864,7 +864,7 @@ fn save_relmap_page(
     // skip xl_relmap_update
     buf.advance(12);
 
-    timeline.put_page_image(tag, 0, lsn, Bytes::copy_from_slice(&buf[..]))?;
+    timeline.put_page_image(tag, 0, lsn, &buf[..])?;
 
     Ok(())
 }

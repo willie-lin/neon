@@ -875,7 +875,7 @@ impl Timeline for LayeredTimeline {
         Ok(())
     }
 
-    fn put_page_image(&self, rel: RelishTag, blknum: u32, lsn: Lsn, img: Bytes) -> Result<()> {
+    fn put_page_image(&self, rel: RelishTag, blknum: u32, lsn: Lsn, img: &[u8]) -> Result<()> {
         if !rel.is_blocky() && blknum != 0 {
             bail!(
                 "invalid request for block {} for non-blocky relish {}",
@@ -888,7 +888,7 @@ impl Timeline for LayeredTimeline {
         let seg = SegmentTag::from_blknum(rel, blknum);
 
         let delta_size = self.perform_write_op(seg, lsn, |layer| {
-            layer.put_page_image(blknum, lsn, img.clone())
+            layer.put_page_image(blknum, lsn, img)
         })?;
 
         self.increase_current_logical_size(delta_size * BLCKSZ as u32);

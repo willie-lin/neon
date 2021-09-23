@@ -177,7 +177,7 @@ impl Layer for InMemoryLayer {
                 .range((Included(&minkey), Included(&maxkey)));
             while let Some(((_blknum, _entry_lsn), entry)) = iter.next_back() {
                 if let Some(img) = &entry.page_image {
-                    reconstruct_data.page_img = Some(img.clone());
+                    reconstruct_data.page_img = Some(Bytes::copy_from_slice(img));
                     need_image = false;
                     break;
                 } else if let Some(rec) = &entry.record {
@@ -365,12 +365,12 @@ impl InMemoryLayer {
     }
 
     /// Remember new page version, as a full page image
-    pub fn put_page_image(&self, blknum: u32, lsn: Lsn, img: Bytes) -> WriteResult<u32> {
+    pub fn put_page_image(&self, blknum: u32, lsn: Lsn, img: &[u8]) -> WriteResult<u32> {
         self.put_page_version(
             blknum,
             lsn,
             PageVersion {
-                page_image: Some(img),
+                page_image: Some(img.to_vec()),
                 record: None,
             },
         )
@@ -430,7 +430,7 @@ impl InMemoryLayer {
                 let gapstart = self.seg.segno * RELISH_SEG_SIZE + oldsize;
                 for gapblknum in gapstart..blknum {
                     let zeropv = PageVersion {
-                        page_image: Some(ZERO_PAGE.clone()),
+                        page_image: Some(ZERO_PAGE.to_vec()),
                         record: None,
                     };
                     trace!(
