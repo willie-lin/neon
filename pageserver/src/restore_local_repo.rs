@@ -311,7 +311,7 @@ pub fn save_decoded_record(
             main_data_offset: decoded.main_data_offset as u32,
         };
 
-        timeline.put_wal_record(tag, blk.blkno, rec)?;
+        timeline.put_wal_record(tag, blk.blkno, &rec)?;
     }
 
     let mut buf = decoded.record.clone();
@@ -641,7 +641,7 @@ fn save_xact_record(
             segno,
         },
         rpageno,
-        rec.clone(),
+        &rec,
     )?;
 
     for subxact in &parsed.subxacts {
@@ -656,7 +656,7 @@ fn save_xact_record(
                     segno,
                 },
                 rpageno,
-                rec.clone(),
+                &rec,
             )?;
         }
     }
@@ -756,7 +756,7 @@ fn save_multixact_create_record(
             segno,
         },
         rpageno,
-        rec.clone(),
+        &rec,
     )?;
 
     let first_mbr_pageno = xlrec.moff / pg_constants::MULTIXACT_MEMBERS_PER_PAGE as u32;
@@ -775,7 +775,7 @@ fn save_multixact_create_record(
                 segno,
             },
             rpageno,
-            rec.clone(),
+            &rec,
         )?;
 
         if pageno == last_mbr_pageno {

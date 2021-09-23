@@ -770,7 +770,7 @@ impl Timeline for LayeredTimeline {
         Ok(result)
     }
 
-    fn put_wal_record(&self, rel: RelishTag, blknum: u32, rec: WALRecord) -> Result<()> {
+    fn put_wal_record(&self, rel: RelishTag, blknum: u32, rec: &WALRecord) -> Result<()> {
         if !rel.is_blocky() && blknum != 0 {
             bail!(
                 "invalid request for block {} for non-blocky relish {}",

@@ -127,7 +127,7 @@ pub trait Timeline: Send + Sync {
     ///
     /// This will implicitly extend the relation, if the page is beyond the
     /// current end-of-file.
-    fn put_wal_record(&self, tag: RelishTag, blknum: u32, rec: WALRecord) -> Result<()>;
+    fn put_wal_record(&self, tag: RelishTag, blknum: u32, rec: &WALRecord) -> Result<()>;
 
     /// Like put_wal_record, but with ready-made image of the page.
     fn put_page_image(&self, tag: RelishTag, blknum: u32, lsn: Lsn, img: Bytes) -> Result<()>;
