@@ -11,7 +11,7 @@
 //! from data stored in object storage.
 //!
 use anyhow::Result;
-use bytes::{BufMut, BytesMut};
+use bytes::BufMut;
 use log::*;
 use std::io;
 use std::io::Write;
@@ -224,7 +224,7 @@ impl<'a> Basebackup<'a> {
             .timeline
             .get_page_at_lsn(RelishTag::TwoPhase { xid }, 0, self.lsn)?;
 
-        let mut buf = BytesMut::new();
+        let mut buf = Vec::new();
         buf.extend_from_slice(&img[..]);
         let crc = crc32c::crc32c(&img[..]);
         buf.put_u32_le(crc);
