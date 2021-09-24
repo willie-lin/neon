@@ -46,6 +46,7 @@ use crate::waldecoder;
 use crate::PageServerConf;
 use crate::{ZTenantId, ZTimelineId};
 use anyhow::{bail, Result};
+use bytes::Bytes;
 use log::*;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -226,7 +227,7 @@ impl Layer for DeltaLayer {
 
                 if let Some(img) = pv.page_image {
                     // Found a page image, return it
-                    reconstruct_data.page_img = Some(img);
+                    reconstruct_data.page_img = Some(Bytes::copy_from_slice(&img));
                     need_image = false;
                     break;
                 } else if let Some(rec) = pv.record {
@@ -423,12 +424,14 @@ impl DeltaLayer {
 
         let mut page_version_writer = BlobWriter::new(book, PAGE_VERSIONS_CHAPTER);
 
+        let mut buf = Vec::new();
+
         for (key, page_version) in page_versions {
-            let buf = PageVersion::ser(&page_version)?;
+            PageVersion::ser_into(&page_version, &mut buf)?;
             let blob_range = page_version_writer.write_blob(&buf)?;
+            buf.clear();
 
             let old = inner.page_version_metas.insert(*key, blob_range);
-
             assert!(old.is_none());
         }
 
