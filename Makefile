@@ -30,8 +30,8 @@ tmp_install/build/config.status:
 	+@echo "Configuring postgres build"
 	mkdir -p tmp_install/build
 	(cd tmp_install/build && \
-	../../vendor/postgres/configure CFLAGS='-O0 -g3 $(CFLAGS)' \
-		--enable-cassert \
+	../../vendor/postgres/configure CC='ccache gcc' CFLAGS='-O2 -g3 $(CFLAGS)' \
+		--disable-cassert \
 		--enable-debug \
 		--enable-depend \
 		$(SECCOMP) \

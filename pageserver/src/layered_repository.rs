@@ -48,6 +48,7 @@ use zenith_utils::lsn::{AtomicLsn, Lsn, RecordLsn};
 use zenith_utils::seqwait::SeqWait;
 
 mod blob;
+mod block_lsn_map;
 mod delta_layer;
 mod filename;
 mod image_layer;
