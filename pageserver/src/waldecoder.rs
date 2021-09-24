@@ -162,7 +162,7 @@ impl WalStreamDecoder {
                     let recordbuf = std::mem::replace(&mut self.recordbuf, BytesMut::new());
 
                     let recordbuf = recordbuf.freeze();
-                    let mut buf = recordbuf.clone();
+                    let mut buf = std::io::Cursor::new(&recordbuf);
 
                     let xlogrec = XLogRecord::from_bytes(&mut buf);
 
@@ -268,7 +268,7 @@ pub struct XlRelmapUpdate {
 }
 
 impl XlRelmapUpdate {
-    pub fn decode(buf: &mut Bytes) -> XlRelmapUpdate {
+    pub fn decode(buf: &mut (impl std::io::Read + bytes::Buf)) -> XlRelmapUpdate {
         XlRelmapUpdate {
             dbid: buf.get_u32_le(),
             tsid: buf.get_u32_le(),
@@ -286,7 +286,7 @@ pub struct XlSmgrTruncate {
 }
 
 impl XlSmgrTruncate {
-    pub fn decode(buf: &mut Bytes) -> XlSmgrTruncate {
+    pub fn decode(buf: &mut (impl std::io::Read + bytes::Buf)) -> XlSmgrTruncate {
         XlSmgrTruncate {
             blkno: buf.get_u32_le(),
             rnode: RelFileNode {
@@ -309,7 +309,7 @@ pub struct XlCreateDatabase {
 }
 
 impl XlCreateDatabase {
-    pub fn decode(buf: &mut Bytes) -> XlCreateDatabase {
+    pub fn decode(buf: &mut (impl std::io::Read + bytes::Buf)) -> XlCreateDatabase {
         XlCreateDatabase {
             db_id: buf.get_u32_le(),
             tablespace_id: buf.get_u32_le(),
@@ -328,7 +328,7 @@ pub struct XlDropDatabase {
 }
 
 impl XlDropDatabase {
-    pub fn decode(buf: &mut Bytes) -> XlDropDatabase {
+    pub fn decode(buf: &mut (impl std::io::Read + bytes::Buf)) -> XlDropDatabase {
         let mut rec = XlDropDatabase {
             db_id: buf.get_u32_le(),
             n_tablespaces: buf.get_u32_le(),
@@ -352,7 +352,7 @@ pub struct XlHeapInsert {
 }
 
 impl XlHeapInsert {
-    pub fn decode(buf: &mut Bytes) -> XlHeapInsert {
+    pub fn decode(buf: &mut (impl std::io::Read + bytes::Buf)) -> XlHeapInsert {
         XlHeapInsert {
             offnum: buf.get_u16_le(),
             flags: buf.get_u8(),
@@ -369,7 +369,7 @@ pub struct XlHeapMultiInsert {
 }
 
 impl XlHeapMultiInsert {
-    pub fn decode(buf: &mut Bytes) -> XlHeapMultiInsert {
+    pub fn decode(buf: &mut (impl std::io::Read + bytes::Buf)) -> XlHeapMultiInsert {
         XlHeapMultiInsert {
             flags: buf.get_u8(),
             _padding: buf.get_u8(),
@@ -390,7 +390,7 @@ pub struct XlHeapDelete {
 }
 
 impl XlHeapDelete {
-    pub fn decode(buf: &mut Bytes) -> XlHeapDelete {
+    pub fn decode(buf: &mut (impl std::io::Read + bytes::Buf)) -> XlHeapDelete {
         XlHeapDelete {
             xmax: buf.get_u32_le(),
             offnum: buf.get_u16_le(),
@@ -415,7 +415,7 @@ pub struct XlHeapUpdate {
 }
 
 impl XlHeapUpdate {
-    pub fn decode(buf: &mut Bytes) -> XlHeapUpdate {
+    pub fn decode(buf: &mut (impl std::io::Read + bytes::Buf)) -> XlHeapUpdate {
         XlHeapUpdate {
             old_xmax: buf.get_u32_le(),
             old_offnum: buf.get_u16_le(),
@@ -454,7 +454,7 @@ impl XlXactParsedRecord {
     /// Decode a XLOG_XACT_COMMIT/ABORT/COMMIT_PREPARED/ABORT_PREPARED
     /// record. This should agree with the ParseCommitRecord and ParseAbortRecord
     /// functions in PostgreSQL (in src/backend/access/rmgr/xactdesc.c)
-    pub fn decode(buf: &mut Bytes, mut xid: TransactionId, xl_info: u8) -> XlXactParsedRecord {
+    pub fn decode(buf: &mut (impl std::io::Read + bytes::Buf), mut xid: TransactionId, xl_info: u8) -> XlXactParsedRecord {
         let info = xl_info & pg_constants::XLOG_XACT_OPMASK;
         // The record starts with time of commit/abort
         let xact_time = buf.get_i64_le();
@@ -534,7 +534,7 @@ pub struct XlClogTruncate {
 }
 
 impl XlClogTruncate {
-    pub fn decode(buf: &mut Bytes) -> XlClogTruncate {
+    pub fn decode(buf: &mut (impl std::io::Read + bytes::Buf)) -> XlClogTruncate {
         XlClogTruncate {
             pageno: buf.get_u32_le(),
             oldest_xid: buf.get_u32_le(),
@@ -551,7 +551,7 @@ pub struct MultiXactMember {
 }
 
 impl MultiXactMember {
-    pub fn decode(buf: &mut Bytes) -> MultiXactMember {
+    pub fn decode(buf: &mut (impl std::io::Read + bytes::Buf)) -> MultiXactMember {
         MultiXactMember {
             xid: buf.get_u32_le(),
             status: buf.get_u32_le(),
@@ -569,7 +569,7 @@ pub struct XlMultiXactCreate {
 }
 
 impl XlMultiXactCreate {
-    pub fn decode(buf: &mut Bytes) -> XlMultiXactCreate {
+    pub fn decode(buf: &mut (impl std::io::Read + bytes::Buf)) -> XlMultiXactCreate {
         let mid = buf.get_u32_le();
         let moff = buf.get_u32_le();
         let nmembers = buf.get_u32_le();
@@ -600,7 +600,7 @@ pub struct XlMultiXactTruncate {
 }
 
 impl XlMultiXactTruncate {
-    pub fn decode(buf: &mut Bytes) -> XlMultiXactTruncate {
+    pub fn decode(buf: &mut (impl std::io::Read + bytes::Buf)) -> XlMultiXactTruncate {
         XlMultiXactTruncate {
             oldest_multi_db: buf.get_u32_le(),
             start_trunc_off: buf.get_u32_le(),
@@ -635,7 +635,7 @@ pub fn decode_wal_record(record: Bytes) -> DecodedWALRecord {
     let mut rnode_relnode: u32 = 0;
     let mut got_rnode = false;
 
-    let mut buf = record.clone();
+    let mut buf = std::io::Cursor::new(&record);
 
     // 1. Parse XLogRecord struct
 
@@ -963,7 +963,7 @@ pub fn decode_wal_record(record: Bytes) -> DecodedWALRecord {
 /// Build a human-readable string to describe a WAL record
 ///
 /// For debugging purposes
-pub fn describe_wal_record(record: &Bytes) -> String {
+pub fn describe_wal_record(record: &[u8]) -> String {
     // TODO: It would be nice to use the PostgreSQL rmgrdesc infrastructure for this.
     // Maybe use the postgres wal redo process, the same used for replaying WAL records?
     // Or could we compile the rmgrdesc routines into the dump_layer_file() binary directly,

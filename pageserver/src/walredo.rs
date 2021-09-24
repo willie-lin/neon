@@ -278,7 +278,7 @@ impl PostgresRedoManager {
             }
             // Apply all collected WAL records
             for record in records {
-                let mut buf = record.rec.clone();
+                let mut buf = std::io::Cursor::new(&record.rec);
 
                 WAL_REDO_RECORD_COUNTER.inc();
 
@@ -578,7 +578,7 @@ impl PostgresRedoProcess {
                 WAL_REDO_RECORD_COUNTER.inc();
 
                 stdin
-                    .write_all(&build_apply_record_msg(r.lsn, r.rec))
+                    .write_all(&build_apply_record_msg(r.lsn, &r.rec))
                     .await?;
 
                 //debug!("sent WAL record to wal redo postgres process ({:X}/{:X}",
@@ -664,7 +664,7 @@ fn build_push_page_msg(tag: BufferTag, base_img: Bytes) -> Bytes {
     buf.freeze()
 }
 
-fn build_apply_record_msg(endlsn: Lsn, rec: Bytes) -> Bytes {
+fn build_apply_record_msg(endlsn: Lsn, rec: &[u8]) -> Bytes {
     let len = 4 + 8 + rec.len();
     let mut buf = BytesMut::with_capacity(1 + len);
 

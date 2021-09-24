@@ -12,7 +12,7 @@ use std::io::Read;
 use std::path::Path;
 
 use anyhow::Result;
-use bytes::{Buf, Bytes};
+use bytes::Buf;
 
 use crate::relish::*;
 use crate::repository::*;
@@ -289,7 +289,7 @@ pub fn save_decoded_record(
     checkpoint: &mut CheckPoint,
     timeline: &dyn Timeline,
     decoded: &DecodedWALRecord,
-    recdata: Bytes,
+    recdata: &[u8],
     lsn: Lsn,
 ) -> Result<()> {
     checkpoint.update_next_xid(decoded.xl_xid);
@@ -307,14 +307,14 @@ pub fn save_decoded_record(
         let rec = WALRecord {
             lsn,
             will_init: blk.will_init || blk.apply_image,
-            rec: recdata.clone(),
+            rec: recdata.to_vec(),
             main_data_offset: decoded.main_data_offset as u32,
         };
 
         timeline.put_wal_record(tag, blk.blkno, &rec)?;
     }
 
-    let mut buf = decoded.record.clone();
+    let mut buf = std::io::Cursor::new(&decoded.record);
     buf.advance(decoded.main_data_offset);
 
     // Handle a few special record types
@@ -632,7 +632,7 @@ fn save_xact_record(
     let rec = WALRecord {
         lsn,
         will_init: false,
-        rec: decoded.record.clone(),
+        rec: decoded.record.to_vec(),
         main_data_offset: decoded.main_data_offset as u32,
     };
     timeline.put_wal_record(
@@ -744,7 +744,7 @@ fn save_multixact_create_record(
     let rec = WALRecord {
         lsn,
         will_init: false,
-        rec: decoded.record.clone(),
+        rec: decoded.record.to_vec(),
         main_data_offset: decoded.main_data_offset as u32,
     };
     let pageno = xlrec.mid / pg_constants::MULTIXACT_OFFSETS_PER_PAGE as u32;

@@ -172,7 +172,7 @@ pub trait Timeline: Send + Sync {
 pub struct WALRecord {
     pub lsn: Lsn, // LSN at the *end* of the record
     pub will_init: bool,
-    pub rec: Bytes,
+    pub rec: Vec<u8>,
     // Remember the offset of main_data in rec,
     // so that we don't have to parse the record again.
     // If record has no main_data, this offset equals rec.len().
@@ -196,7 +196,7 @@ impl WALRecord {
         WALRecord {
             lsn,
             will_init,
-            rec: Bytes::from(dst),
+            rec: dst,
             main_data_offset,
         }
     }

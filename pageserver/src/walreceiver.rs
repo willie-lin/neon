@@ -208,7 +208,7 @@ fn walreceiver_main(
                         &mut checkpoint,
                         &*timeline,
                         &decoded,
-                        recdata,
+                        &recdata,
                         lsn,
                     )?;
 

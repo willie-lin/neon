@@ -329,9 +329,9 @@ pub fn main() {
 }
 
 impl XLogRecord {
-    pub fn from_bytes(buf: &mut Bytes) -> XLogRecord {
+    pub fn from_bytes(buf: &mut impl Read) -> XLogRecord {
         use zenith_utils::bin_ser::LeSer;
-        XLogRecord::des_from(&mut buf.reader()).unwrap()
+        XLogRecord::des_from(buf).unwrap()
     }
 
     pub fn encode(&self) -> Bytes {
