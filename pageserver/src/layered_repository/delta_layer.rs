@@ -62,7 +62,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use bookfile::{Book, BookWriter};
 
-use zenith_utils::bin_ser::BeSer;
+use zenith_utils::bin_ser::LeSer;
 use zenith_utils::lsn::Lsn;
 
 use super::blob::{read_blob, BlobRange};

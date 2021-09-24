@@ -42,7 +42,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use bookfile::{Book, BookWriter};
 
-use zenith_utils::bin_ser::BeSer;
+use zenith_utils::bin_ser::LeSer;
 use zenith_utils::lsn::Lsn;
 
 // Magic constant to identify a Zenith segment image file

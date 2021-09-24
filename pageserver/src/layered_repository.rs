@@ -43,7 +43,7 @@ use zenith_metrics::{
     register_histogram, register_int_gauge_vec, Histogram, IntGauge, IntGaugeVec,
 };
 use zenith_metrics::{register_histogram_vec, HistogramVec};
-use zenith_utils::bin_ser::BeSer;
+use zenith_utils::bin_ser::LeSer;
 use zenith_utils::lsn::{AtomicLsn, Lsn, RecordLsn};
 use zenith_utils::seqwait::SeqWait;
 
