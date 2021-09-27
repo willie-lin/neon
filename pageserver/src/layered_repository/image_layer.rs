@@ -374,14 +374,69 @@ impl ImageLayer {
             lsn,
         );
 
-        let mut base_images: Vec<Bytes> = Vec::new();
-        for blknum in startblk..(startblk + size) {
-            let img = timeline.materialize_page(seg, blknum, lsn, &*src)?;
+        let image_type = if seg.rel.is_blocky() {
+            ImageType::Blocky { num_blocks: size - startblk }
+        } else {
+            ImageType::NonBlocky
+        };
 
-            base_images.push(img);
+        let layer = ImageLayer {
+            path_or_conf: PathOrConf::Conf(conf),
+            timelineid,
+            tenantid: timeline.tenantid,
+            seg,
+            lsn,
+            inner: Mutex::new(ImageLayerInner {
+                loaded: true,
+                image_type: image_type.clone(),
+            }),
+        };
+
+        // Write the images into a file
+        let path = layer
+            .path()
+            .expect("ImageLayer is supposed to have a layer path on disk");
+        // Note: This overwrites any existing file. There shouldn't be any.
+        // FIXME: throw an error instead?
+        let file = File::create(&path)?;
+        let buf_writer = BufWriter::new(file);
+        let mut book = BookWriter::new(buf_writer, IMAGE_FILE_MAGIC)?;
+
+        if seg.rel.is_blocky() {
+            let mut chapter = book.new_chapter(BLOCKY_IMAGES_CHAPTER);
+
+            for blknum in startblk..(startblk + size) {
+                let img = timeline.materialize_page(seg, blknum, lsn, &*src)?;
+                assert_eq!(img.len(), BLOCK_SIZE);
+                chapter.write_all(&img)?;
+            }
+            book = chapter.close()?;
+        } else {
+            let mut chapter = book.new_chapter(NONBLOCKY_IMAGE_CHAPTER);
+
+            let img = timeline.materialize_page(seg, 0, lsn, &*src)?;
+
+            chapter.write_all(&img)?;
+            book = chapter.close()?;
         }
 
-        Self::create(conf, timelineid, timeline.tenantid, seg, lsn, base_images)
+        let mut chapter = book.new_chapter(SUMMARY_CHAPTER);
+        let summary = Summary {
+            tenantid: timeline.tenantid,
+            timelineid,
+            seg,
+
+            lsn,
+        };
+        Summary::ser_into(&summary, &mut chapter)?;
+        let book = chapter.close()?;
+
+        // This flushes the underlying 'buf_writer'.
+        book.close()?;
+
+        trace!("saved {}", &path.display());
+
+        Ok(layer)
     }
 
     ///

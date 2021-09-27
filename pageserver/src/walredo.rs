@@ -566,7 +566,7 @@ impl PostgresRedoProcess {
             if base_img.is_some() {
                 timeout(
                     TIMEOUT,
-                    stdin.write_all(&build_push_page_msg(tag, base_img.unwrap())),
+                    stdin.write_all(&build_push_page_msg(tag, &base_img.unwrap())),
                 )
                 .await??;
             }
@@ -622,15 +622,17 @@ fn build_begin_redo_for_block_msg(tag: BufferTag) -> Vec<u8> {
     buf.put_u8(b'B');
     buf.put_u32(len as u32);
 
-    let buf = tag.ser()
+    let mut writer = buf.writer();
+    tag.ser_into(&mut writer)
         .expect("serialize BufferTag should always succeed");
+    let buf = writer.into_inner();
 
     debug_assert!(buf.len() == 1 + len);
 
     buf
 }
 
-fn build_push_page_msg(tag: BufferTag, base_img: Bytes) -> Vec<u8> {
+fn build_push_page_msg(tag: BufferTag, base_img: &[u8]) -> Vec<u8> {
     assert!(base_img.len() == 8192);
 
     let len = 4 + 1 + 4 * 4 + base_img.len();
