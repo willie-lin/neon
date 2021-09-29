@@ -10,6 +10,7 @@ use crate::layered_repository::storage_layer::{
 use crate::layered_repository::LayeredTimeline;
 use crate::layered_repository::ZERO_PAGE;
 use crate::layered_repository::{DeltaLayer, ImageLayer};
+use crate::layered_repository::pagestore::BumpLock;
 use crate::repository::WALRecord;
 use crate::PageServerConf;
 use crate::{ZTenantId, ZTimelineId};
@@ -20,7 +21,9 @@ use std::cmp::min;
 use std::collections::BTreeMap;
 use std::ops::Bound::Included;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+
+use std::ops::DerefMut;
 
 use zenith_utils::accum::Accum;
 use zenith_utils::lsn::Lsn;
@@ -45,10 +48,10 @@ pub struct InMemoryLayer {
 
     /// The above fields never change. The parts that do change are in 'inner',
     /// and protected by mutex.
-    inner: RwLock<InMemoryLayerInner>,
+    inner: BumpLock,
 }
 
-pub struct InMemoryLayerInner {
+pub struct InMemoryLayerInner<'a> {
     /// If this relation was dropped, remember when that happened.
     drop_lsn: Option<Lsn>,
 
@@ -56,7 +59,7 @@ pub struct InMemoryLayerInner {
     /// All versions of all pages in the layer are are kept here.
     /// Indexed by block number and LSN.
     ///
-    page_versions: BTreeMap<(u32, Lsn), PageVersion>,
+    page_versions: BTreeMap<(u32, Lsn), &'a PageVersion>,
 
     ///
     /// `segsizes` tracks the size of the segment at different points in time.
@@ -71,7 +74,7 @@ pub struct InMemoryLayerInner {
     predecessor: Option<Arc<dyn Layer>>,
 }
 
-impl InMemoryLayerInner {
+impl<'a> InMemoryLayerInner<'a> {
     fn check_writeable(&self) -> WriteResult<()> {
         if self.writeable {
             Ok(())
@@ -90,13 +93,23 @@ impl InMemoryLayerInner {
             0
         }
     }
+
+    pub fn new() -> Self {
+        InMemoryLayerInner {
+            drop_lsn: None,
+            page_versions: BTreeMap::new(),
+            segsizes: BTreeMap::new(),
+            writeable: false,
+            predecessor: None,
+        }
+    }
 }
 
 impl Layer for InMemoryLayer {
     // An in-memory layer doesn't really have a filename as it's not stored on disk,
     // but we construct a filename as if it was a delta layer
     fn filename(&self) -> PathBuf {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read();
 
         let end_lsn;
         let dropped;
@@ -140,7 +153,7 @@ impl Layer for InMemoryLayer {
             return Lsn(end_lsn.0 + 1);
         }
 
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read();
 
         if let Some(drop_lsn) = inner.drop_lsn {
             drop_lsn
@@ -150,7 +163,7 @@ impl Layer for InMemoryLayer {
     }
 
     fn is_dropped(&self) -> bool {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read();
         inner.drop_lsn.is_some()
     }
 
@@ -168,7 +181,7 @@ impl Layer for InMemoryLayer {
         let predecessor: Option<Arc<dyn Layer>>;
 
         {
-            let inner = self.inner.read().unwrap();
+            let inner = self.inner.read();
 
             // Scan the BTreeMap backwards, starting from reconstruct_data.lsn.
             let minkey = (blknum, Lsn(0));
@@ -215,13 +228,13 @@ impl Layer for InMemoryLayer {
     fn get_seg_size(&self, lsn: Lsn) -> Result<u32> {
         assert!(lsn >= self.start_lsn);
 
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read();
         Ok(inner.get_seg_size(lsn))
     }
 
     /// Does this segment exist at given LSN?
     fn get_seg_exists(&self, lsn: Lsn) -> Result<bool> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read();
 
         // If the segment created after requested LSN,
         // it doesn't exist in the layer. But we shouldn't
@@ -253,13 +266,13 @@ impl Layer for InMemoryLayer {
     }
 
     fn is_incremental(&self) -> bool {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read();
         inner.predecessor.is_some()
     }
 
     /// debugging function to print out the contents of the layer
     fn dump(&self) -> Result<()> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read();
 
         let end_str = inner
             .drop_lsn
@@ -341,13 +354,7 @@ impl InMemoryLayer {
             start_lsn,
             end_lsn: None,
             oldest_pending_lsn,
-            inner: RwLock::new(InMemoryLayerInner {
-                drop_lsn: None,
-                page_versions: BTreeMap::new(),
-                segsizes: BTreeMap::new(),
-                writeable: true,
-                predecessor: None,
-            }),
+            inner: BumpLock::new(),
         })
     }
 
@@ -390,11 +397,14 @@ impl InMemoryLayer {
             self.timelineid,
             lsn
         );
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write();
 
         inner.check_writeable()?;
 
-        let old = inner.page_versions.insert((blknum, lsn), pv);
+        //let old = inner.page_versions.insert((blknum, lsn), &pv);
+
+        let g = inner.deref_mut();
+        let old = g.page_versions.insert((blknum, lsn), &pv);
 
         if old.is_some() {
             // We already had an entry for this LSN. That's odd..
@@ -439,6 +449,7 @@ impl InMemoryLayer {
                         gapblknum,
                         blknum
                     );
+                    let zeropv = inner.bump().alloc(zeropv);
                     let old = inner.page_versions.insert((gapblknum, lsn), zeropv);
                     // We already had an entry for this LSN. That's odd..
 
@@ -461,7 +472,7 @@ impl InMemoryLayer {
     pub fn put_truncation(&self, lsn: Lsn, segsize: u32) -> WriteResult<()> {
         self.assert_not_frozen();
 
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write();
         inner.check_writeable()?;
 
         // check that this we truncate to a smaller size than segment was before the truncation
@@ -482,7 +493,7 @@ impl InMemoryLayer {
     pub fn drop_segment(&self, lsn: Lsn) -> WriteResult<()> {
         self.assert_not_frozen();
 
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write();
 
         inner.check_writeable()?;
 
@@ -526,6 +537,11 @@ impl InMemoryLayer {
             segsizes.insert(start_lsn, size);
         }
 
+        let inner = BumpLock::new();
+
+        inner.write().predecessor = Some(src);
+        inner.write().segsizes = segsizes;
+
         Ok(InMemoryLayer {
             conf,
             timelineid,
@@ -534,18 +550,12 @@ impl InMemoryLayer {
             start_lsn,
             end_lsn: None,
             oldest_pending_lsn,
-            inner: RwLock::new(InMemoryLayerInner {
-                drop_lsn: None,
-                page_versions: BTreeMap::new(),
-                segsizes,
-                writeable: true,
-                predecessor: Some(src),
-            }),
+            inner: BumpLock::new(),
         })
     }
 
     pub fn is_writeable(&self) -> bool {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read();
         inner.writeable
     }
 
@@ -565,7 +575,7 @@ impl InMemoryLayer {
         self.assert_not_frozen();
 
         let self_ref = self.clone();
-        let mut inner = self_ref.inner.write().unwrap();
+        let mut inner = self_ref.inner.write();
         // Dropped layers don't need any special freeze actions,
         // they are marked as non-writeable at drop and just
         // written out to disk by checkpointer.
@@ -588,9 +598,12 @@ impl InMemoryLayer {
         assert!(inner.writeable);
         inner.writeable = false;
 
+        let frozen_inner = BumpLock::new();
+        let mut guard = frozen_inner.write();
+
         // Divide all the page versions into old and new
         // at the 'cutoff_lsn' point.
-        let mut before_segsizes = BTreeMap::new();
+        let before_segsizes = &mut guard.segsizes;
         let mut after_segsizes = BTreeMap::new();
         let mut after_oldest_lsn: Accum<Lsn> = Accum(None);
         for (lsn, size) in inner.segsizes.iter() {
@@ -612,6 +625,7 @@ impl InMemoryLayer {
                 before_page_versions.insert((*blknum, *lsn), pv.clone());
             }
         }
+        drop(guard);
 
         let frozen = Arc::new(InMemoryLayer {
             conf: self.conf,
@@ -621,17 +635,11 @@ impl InMemoryLayer {
             start_lsn: self.start_lsn,
             end_lsn: Some(cutoff_lsn),
             oldest_pending_lsn: self.start_lsn,
-            inner: RwLock::new(InMemoryLayerInner {
-                drop_lsn: inner.drop_lsn,
-                page_versions: before_page_versions,
-                segsizes: before_segsizes,
-                writeable: false,
-                predecessor: inner.predecessor.clone(),
-            }),
+            inner: frozen_inner,
         });
 
         let open = if !after_segsizes.is_empty() || !after_page_versions.is_empty() {
-            let mut new_open = Self::create_successor_layer(
+            let new_open = Self::create_successor_layer(
                 self.conf,
                 frozen.clone(),
                 self.timelineid,
@@ -640,9 +648,10 @@ impl InMemoryLayer {
                 after_oldest_lsn.0.unwrap(),
             )?;
 
-            let new_inner = new_open.inner.get_mut().unwrap();
+            let mut new_inner = new_open.inner.write();
             new_inner.page_versions.append(&mut after_page_versions);
             new_inner.segsizes.append(&mut after_segsizes);
+            drop(new_inner);
 
             Some(Arc::new(new_open))
         } else {
@@ -677,12 +686,18 @@ impl InMemoryLayer {
         // lock, it will see that it's not writeable anymore and retry, but it
         // would have to wait until we release it. That race condition is very
         // rare though, so we just accept the potential latency hit for now.
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read();
         assert!(!inner.writeable);
 
         let predecessor = inner.predecessor.clone();
 
         if let Some(drop_lsn) = inner.drop_lsn {
+            let all_page_versions = inner.page_versions.iter().map(|tup| {
+                let (k, pv) = tup;
+
+                (k, *pv)
+            });
+
             let delta_layer = DeltaLayer::create(
                 self.conf,
                 self.timelineid,
@@ -692,7 +707,7 @@ impl InMemoryLayer {
                 drop_lsn,
                 true,
                 predecessor,
-                inner.page_versions.iter(),
+                all_page_versions,
                 inner.segsizes.clone(),
             )?;
             trace!(
@@ -712,10 +727,15 @@ impl InMemoryLayer {
                 before_segsizes.insert(*lsn, *size);
             }
         }
-        let mut before_page_versions = inner.page_versions.iter().filter(|tup| {
-            let ((_blknum, lsn), _pv) = tup;
+        let mut before_page_versions = inner.page_versions.iter().filter_map(|tup| {
+            let (k, pv) = tup;
+            let (_blknum, lsn) = k;
 
-            *lsn < end_lsn
+            if *lsn < end_lsn {
+                Some((k, *pv))
+            } else {
+                None
+            }
         });
 
         let mut frozen_layers: Vec<Arc<dyn Layer>> = Vec::new();
@@ -756,7 +776,7 @@ impl InMemoryLayer {
     }
 
     pub fn update_predecessor(&self, predecessor: Arc<dyn Layer>) -> Option<Arc<dyn Layer>> {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write();
         inner.predecessor.replace(predecessor)
     }
 }

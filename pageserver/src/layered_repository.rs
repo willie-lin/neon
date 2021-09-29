@@ -55,6 +55,7 @@ mod image_layer;
 mod inmemory_layer;
 mod interval_tree;
 mod layer_map;
+mod pagestore;
 mod storage_layer;
 
 use delta_layer::DeltaLayer;
