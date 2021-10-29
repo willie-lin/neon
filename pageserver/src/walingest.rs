@@ -24,6 +24,8 @@
 use postgres_ffi::nonrelfile_utils::clogpage_precedes;
 use postgres_ffi::nonrelfile_utils::slru_may_delete_clogsegment;
 use std::cmp::min;
+use std::convert::TryFrom;
+use std::num::NonZeroU32;
 
 use anyhow::Result;
 use bytes::{Buf, Bytes, BytesMut};
@@ -124,7 +126,7 @@ impl WalIngest {
                 let rec = WALRecord {
                     will_init: blk.will_init || blk.apply_image,
                     rec: recdata.clone(),
-                    main_data_offset: decoded.main_data_offset as u32,
+                    main_data_offset: NonZeroU32::try_from(decoded.main_data_offset as u32)?,
                 };
                 timeline.put_wal_record(lsn, tag, blk.blkno, rec)?;
             }
@@ -486,7 +488,7 @@ impl WalIngest {
         let rec = WALRecord {
             will_init: false,
             rec: decoded.record.clone(),
-            main_data_offset: decoded.main_data_offset as u32,
+            main_data_offset: NonZeroU32::try_from(decoded.main_data_offset as u32)?,
         };
         timeline.put_wal_record(
             lsn,
@@ -601,7 +603,7 @@ impl WalIngest {
         let rec = WALRecord {
             will_init: false,
             rec: decoded.record.clone(),
-            main_data_offset: decoded.main_data_offset as u32,
+            main_data_offset: NonZeroU32::try_from(decoded.main_data_offset as u32)?,
         };
         let pageno = xlrec.mid / pg_constants::MULTIXACT_OFFSETS_PER_PAGE as u32;
         let segno = pageno / pg_constants::SLRU_PAGES_PER_SEGMENT;

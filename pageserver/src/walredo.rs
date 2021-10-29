@@ -19,7 +19,7 @@
 //! process, he cannot escape out of it.
 //!
 use byteorder::{ByteOrder, LittleEndian};
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use lazy_static::lazy_static;
 use log::*;
 use nix::poll::*;
@@ -63,6 +63,10 @@ use postgres_ffi::XLogRecord;
 pub struct BufferTag {
     pub rel: RelTag,
     pub blknum: u32,
+}
+
+pub trait AsWalRecBytes {
+    fn as_wal_rec_bytes(&self) -> &Bytes;
 }
 
 ///
@@ -143,16 +147,22 @@ pub struct PostgresRedoManager {
 }
 
 #[derive(Debug)]
-struct WalRedoRequest {
+struct WalRedoRequest<T>
+where
+    T: AsWalRecBytes,
+{
     rel: RelishTag,
     blknum: u32,
     lsn: Lsn,
 
     base_img: Option<Bytes>,
-    records: Vec<(Lsn, WALRecord)>,
+    records: Vec<(Lsn, T)>,
 }
 
-impl WalRedoRequest {
+impl<T> WalRedoRequest<T>
+where
+    T: AsWalRecBytes,
+{
     // Can this request be served by zenith redo funcitons
     // or we need to pass it to wal-redo postgres process?
     fn can_apply_in_zenith(&self) -> bool {
@@ -253,11 +263,14 @@ impl PostgresRedoManager {
     ///
     /// Process one request for WAL redo using wal-redo postgres
     ///
-    fn handle_apply_request_postgres(
+    fn handle_apply_request_postgres<T>(
         &self,
         process: &mut PostgresRedoProcess,
-        request: &WalRedoRequest,
-    ) -> Result<Bytes, WalRedoError> {
+        request: &WalRedoRequest<T>,
+    ) -> Result<Bytes, WalRedoError>
+    where
+        T: AsWalRecBytes,
+    {
         let blknum = request.blknum;
         let lsn = request.lsn;
         let base_img = request.base_img.clone();
@@ -291,7 +304,13 @@ impl PostgresRedoManager {
     ///
     /// Process one request for WAL redo using custom zenith code
     ///
-    fn handle_apply_request_zenith(&self, request: &WalRedoRequest) -> Result<Bytes, WalRedoError> {
+    fn handle_apply_request_zenith<T>(
+        &self,
+        request: &WalRedoRequest<T>,
+    ) -> Result<Bytes, WalRedoError>
+    where
+        T: AsWalRecBytes,
+    {
         let rel = request.rel;
         let blknum = request.blknum;
         let lsn = request.lsn;
@@ -317,7 +336,7 @@ impl PostgresRedoManager {
         }
         // Apply all collected WAL records
         for (_lsn, record) in records {
-            let mut buf = record.rec.clone();
+            let mut buf = record.as_wal_rec_bytes().clone();
 
             WAL_REDO_RECORD_COUNTER.inc();
 
@@ -328,10 +347,10 @@ impl PostgresRedoManager {
             //move to main data
             // TODO probably, we should store some records in our special format
             // to avoid this weird parsing on replay
-            let skip = (record.main_data_offset - pg_constants::SIZEOF_XLOGRECORD) as usize;
-            if buf.remaining() > skip {
-                buf.advance(skip);
-            }
+            // let skip = (record.main_data_offset - pg_constants::SIZEOF_XLOGRECORD) as usize;
+            // if buf.remaining() > skip {
+            //     buf.advance(skip);
+            // }
 
             if xlogrec.xl_rmid == pg_constants::RM_XACT_ID {
                 // Transaction manager stuff
@@ -440,6 +459,11 @@ impl PostgresRedoManager {
                 } else {
                     panic!();
                 }
+            } else {
+                panic!(
+                    "Zenith replay of rmgr={} is not implemented",
+                    xlogrec.xl_rmid
+                );
             }
         }
 
@@ -557,12 +581,15 @@ impl PostgresRedoProcess {
     // Apply given WAL records ('records') over an old page image. Returns
     // new page image.
     //
-    fn apply_wal_records(
+    fn apply_wal_records<T>(
         &mut self,
         tag: BufferTag,
         base_img: Option<Bytes>,
-        records: &[(Lsn, WALRecord)],
-    ) -> Result<Bytes, std::io::Error> {
+        records: &[(Lsn, T)],
+    ) -> Result<Bytes, std::io::Error>
+    where
+        T: AsWalRecBytes,
+    {
         // Serialize all the messages to send the WAL redo process first.
         //
         // This could be problematic if there are millions of records to replay,
@@ -574,7 +601,7 @@ impl PostgresRedoProcess {
             build_push_page_msg(tag, &img, &mut writebuf);
         }
         for (lsn, rec) in records.iter() {
-            build_apply_record_msg(*lsn, &rec.rec, &mut writebuf);
+            build_apply_record_msg(*lsn, rec.as_wal_rec_bytes(), &mut writebuf);
         }
         build_get_page_msg(tag, &mut writebuf);
         WAL_REDO_RECORD_COUNTER.inc_by(records.len() as u64);

@@ -7,18 +7,31 @@ use crate::repository::WALRecord;
 use crate::{ZTenantId, ZTimelineId};
 use anyhow::Result;
 use bytes::Bytes;
+use postgres_ffi::pg_constants::BLCKSZ;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::PathBuf;
 
+use crate::layered_repository::layers::meta::LayerMetadata;
 use zenith_utils::lsn::Lsn;
 
-// Size of one segment in pages (10 MB)
-pub const RELISH_SEG_SIZE: u32 = 10 * 1024 * 1024 / 8192;
+/// Size of one segment in pages (8GiB of data).
+///
+/// Notes:
+///  - The visibility map is ~ 1B / 4 pages * 2^32 pages = 1GiB, thus easily fits in
+///     one relish segment
+///  - An FSM is 2B /page (+ overhead) * 2^32 pages = 8GiB, thus for max-sized
+///     relations this is slightly larger than this segment size; but this should
+///     generally not be problematic; that'll only appear for relations >> 2TiB
+///  - Default relation forks contain max 4096 segments (2^32 / 2^20 = 2^12 = 4096).
+///
+/// Sidenote: the largest intermediate value in this calculation is 2^33, which doesn't fit in
+/// u32, so we use u64 for intermediate results in the calculation.
+pub const RELISH_SEG_SIZE: u32 = (8u64 * 1024u64 * 1024u64 / (BLCKSZ as u64)) as u32;
 
 ///
 /// Each relish stored in the repository is divided into fixed-sized "segments",
-/// with 10 MB of key-space, or 1280 8k pages each.
+/// with 8GiB of key-space, or 2^20 8k pages each.
 ///
 #[derive(Debug, PartialEq, Eq, PartialOrd, Hash, Ord, Clone, Copy, Serialize, Deserialize)]
 pub struct SegmentTag {
@@ -40,6 +53,16 @@ impl SegmentTag {
         }
     }
 
+    pub fn blknum_to_offset(&self, blknum: u32) -> u32 {
+        debug_assert!(self.blknum_in_seg(blknum));
+        return blknum - (self.segno * RELISH_SEG_SIZE);
+    }
+
+    pub fn offset_to_blknum(&self, offset: u32) -> u32 {
+        debug_assert!(offset < RELISH_SEG_SIZE);
+        return offset + (self.segno * RELISH_SEG_SIZE);
+    }
+
     pub fn blknum_in_seg(&self, blknum: u32) -> bool {
         blknum / RELISH_SEG_SIZE == self.segno
     }
@@ -55,6 +78,38 @@ impl SegmentTag {
 pub enum PageVersion {
     Page(Bytes),
     Wal(WALRecord),
+}
+
+///
+/// Utility traits for storage layers to determine whether a page version initializes
+/// the page, without having to move around the actual PageVersion data.
+///
+pub enum VersionType {
+    /// The PageVersion will (re-)initialize the page, no earlier pageversions required to
+    /// restore the page.
+    Init,
+    /// The PageVersion will apply changes to the page and thus needs an earlier version
+    /// of the page.
+    Delta,
+}
+
+pub trait AsVersionType {
+    fn as_version_type(&self) -> VersionType;
+}
+
+impl AsVersionType for PageVersion {
+    fn as_version_type(&self) -> VersionType {
+        match self {
+            PageVersion::Page(_) => VersionType::Init,
+            PageVersion::Wal(rec) => {
+                if rec.will_init {
+                    VersionType::Init
+                } else {
+                    VersionType::Delta
+                }
+            }
+        }
+    }
 }
 
 ///
@@ -159,6 +214,18 @@ pub trait Layer: Send + Sync {
 
     /// Returns true for layers that are represented in memory.
     fn is_in_memory(&self) -> bool;
+
+    /// Get an iterator detailing the latest page versions of each page in
+    /// this layer.
+    ///
+    /// Pages with no changes are omitted.
+    ///
+    /// The implementor must ensure that this view of the pageversions
+    /// is self-consistent, i.e. that if an LSN is emitted, then all other
+    /// pages have at least been replayed up to that LSN.
+    fn latest_page_versions_since_snapshot(
+        &self,
+    ) -> Option<Box<dyn Iterator<Item = (u32, Lsn)> + '_>>;
 
     /// Release memory used by this layer. There is no corresponding 'load'
     /// function, that's done implicitly when you call one of the get-functions.

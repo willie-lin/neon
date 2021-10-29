@@ -1,9 +1,11 @@
 use crate::relish::*;
+use crate::walredo::AsWalRecBytes;
 use crate::CheckpointConfig;
 use anyhow::Result;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::num::NonZeroU32;
 use std::ops::{AddAssign, Deref};
 use std::sync::Arc;
 use std::time::Duration;
@@ -280,7 +282,13 @@ pub struct WALRecord {
     // Remember the offset of main_data in rec,
     // so that we don't have to parse the record again.
     // If record has no main_data, this offset equals rec.len().
-    pub main_data_offset: u32,
+    pub main_data_offset: NonZeroU32,
+}
+
+impl AsWalRecBytes for WALRecord {
+    fn as_wal_rec_bytes(&self) -> &Bytes {
+        return &self.rec;
+    }
 }
 
 #[cfg(test)]

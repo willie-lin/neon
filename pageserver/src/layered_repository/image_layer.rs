@@ -42,6 +42,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use bookfile::{Book, BookWriter};
 
+use crate::layered_repository::layers::meta::snapshot_meta::SnapshotMetadata;
 use zenith_utils::bin_ser::BeSer;
 use zenith_utils::lsn::Lsn;
 
@@ -109,6 +110,7 @@ pub struct ImageLayerInner {
 
     /// Derived from filename and bookfile chapter metadata
     image_type: ImageType,
+    metadata: SnapshotMetadata,
 }
 
 impl Layer for ImageLayer {
@@ -249,6 +251,10 @@ impl Layer for ImageLayer {
 
         Ok(())
     }
+
+    fn latest_page_versions_since_snapshot(&self) -> Option<Box<dyn Iterator<Item = (u32, Lsn)>>> {
+        None
+    }
 }
 
 impl ImageLayer {
@@ -292,6 +298,7 @@ impl ImageLayer {
             inner: Mutex::new(ImageLayerInner {
                 book: None,
                 image_type: image_type.clone(),
+                metadata: SnapshotMetadata::new(lsn),
             }),
         };
         let inner = layer.inner.lock().unwrap();
@@ -446,6 +453,7 @@ impl ImageLayer {
 
         *inner = ImageLayerInner {
             book: Some(book),
+            metadata: SnapshotMetadata::new(self.lsn),
             image_type,
         };
 
@@ -468,6 +476,7 @@ impl ImageLayer {
             inner: Mutex::new(ImageLayerInner {
                 book: None,
                 image_type: ImageType::Blocky { num_blocks: 0 },
+                metadata: SnapshotMetadata::new(filename.lsn),
             }),
         }
     }
@@ -491,6 +500,7 @@ impl ImageLayer {
             inner: Mutex::new(ImageLayerInner {
                 book: None,
                 image_type: ImageType::Blocky { num_blocks: 0 },
+                metadata: SnapshotMetadata::new(summary.lsn),
             }),
         })
     }

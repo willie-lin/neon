@@ -15,6 +15,8 @@ futures = "0.3.13"
 hyper = "0.14"
 lazy_static = "1.4.0"
 log = "0.4.14"
+parking_lot = "0.11.2"
+static_assertions = "1.1.0"
 clap = "2.33.0"
 daemonize = "0.4.1"
 tokio = { version = "1.11", features = ["process", "sync", "macros", "fs", "rt", "io-util", "time"] }
@@ -40,6 +42,7 @@ signal-hook = "0.3.10"
 url = "2"
 nix = "0.23"
 once_cell = "1.8.0"
+bitmaps = { git = "https://github.com/mmeent/bitmaps.git", branch = "feature/iterative-improvements" }
 
 rust-s3 = { version = "0.28", default-features = false, features = ["no-verify-ssl", "tokio-rustls-tls"] }
 async-compression = {version = "0.3", features = ["zstd", "tokio"]}

@@ -58,15 +58,17 @@ use zenith_utils::seqwait::SeqWait;
 mod blob;
 mod delta_layer;
 mod ephemeral_file;
+mod filebufutils;
 mod filename;
 mod global_layer_map;
 mod image_layer;
-mod inmemory_layer;
+pub mod inmemory_layer;
 mod interval_tree;
 mod layer_map;
+mod layers;
 pub mod metadata;
 mod page_versions;
-mod storage_layer;
+pub mod storage_layer;
 
 use delta_layer::DeltaLayer;
 use image_layer::ImageLayer;
@@ -80,18 +82,29 @@ use storage_layer::{
 
 // re-export this function so that page_cache.rs can use it.
 pub use crate::layered_repository::ephemeral_file::writeback as writeback_ephemeral_file;
+use crate::layered_repository::filename::DeltaLayerType;
+use crate::layered_repository::layers::differential_layer::DifferentialLayer;
 
 static ZERO_PAGE: Bytes = Bytes::from_static(&[0u8; 8192]);
 
 // Timeout when waiting for WAL receiver to catch up to an LSN given in a GetPage@LSN call.
 static TIMEOUT: Duration = Duration::from_secs(60);
 
+const TIME_BUCKETS: &[f64] = &[
+    0.00001, // 1/100000 s
+    0.0001, 0.00015, 0.0002, 0.00025, 0.0003, 0.00035, 0.0005, 0.00075, // 1/10000 s
+    0.001, 0.0025, 0.005, 0.0075, // 1/1000 s
+    0.01, 0.0125, 0.015, 0.025, 0.05, // 1/100 s
+    0.1,  // 1/10 s
+];
+
 // Metrics collected on operations on the storage repository.
 lazy_static! {
     static ref STORAGE_TIME: HistogramVec = register_histogram_vec!(
         "pageserver_storage_time",
         "Time spent on storage operations",
-        &["operation"]
+        &["operation"],
+        TIME_BUCKETS.into()
     )
     .expect("failed to define a metric");
 }
@@ -100,7 +113,8 @@ lazy_static! {
 lazy_static! {
     static ref RECONSTRUCT_TIME: Histogram = register_histogram!(
         "pageserver_getpage_reconstruct_time",
-        "FIXME Time spent on storage operations"
+        "FIXME Time spent on storage operations",
+        TIME_BUCKETS.into()
     )
     .expect("failed to define a metric");
 }
@@ -1166,10 +1180,23 @@ impl LayeredTimeline {
                 continue;
             }
 
-            let layer = DeltaLayer::new(self.conf, self.timelineid, self.tenantid, filename);
+            let layer: Arc<dyn Layer> = match filename.kind {
+                DeltaLayerType::Delta => Arc::new(DeltaLayer::new(
+                    self.conf,
+                    self.timelineid,
+                    self.tenantid,
+                    filename,
+                )),
+                DeltaLayerType::Differential => Arc::new(DifferentialLayer::new(
+                    self.conf,
+                    self.timelineid,
+                    self.tenantid,
+                    filename,
+                )),
+            };
 
             trace!("found layer {}", layer.filename().display());
-            layers.insert_historic(Arc::new(layer));
+            layers.insert_historic(layer);
             num_layers += 1;
         }
         info!("loaded layer map with {} layers", num_layers);
@@ -1586,6 +1613,10 @@ impl LayeredTimeline {
             for delta_layer in new_historics.delta_layers {
                 layer_uploads.push(delta_layer.path());
                 layers.insert_historic(Arc::new(delta_layer));
+            }
+            for differential_layer in new_historics.differential_layers {
+                layer_uploads.push(differential_layer.path());
+                layers.insert_historic(Arc::new(differential_layer));
             }
             for image_layer in new_historics.image_layers {
                 layer_uploads.push(image_layer.path());

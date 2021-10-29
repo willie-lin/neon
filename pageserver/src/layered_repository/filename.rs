@@ -15,6 +15,12 @@ use zenith_utils::lsn::Lsn;
 
 use super::metadata::METADATA_FILE_NAME;
 
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone)]
+pub enum DeltaLayerType {
+    Delta,
+    Differential,
+}
+
 // Note: LayeredTimeline::load_layer_map() relies on this sort order
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
 pub struct DeltaFileName {
@@ -22,6 +28,7 @@ pub struct DeltaFileName {
     pub start_lsn: Lsn,
     pub end_lsn: Lsn,
     pub dropped: bool,
+    pub kind: DeltaLayerType,
 }
 
 /// Represents the filename of a DeltaLayer
@@ -40,6 +47,17 @@ impl DeltaFileName {
     pub fn parse_str(fname: &str) -> Option<Self> {
         let rel;
         let mut parts;
+
+        let mut name = fname;
+        let kind;
+
+        if let Some(rest) = fname.strip_suffix(".diff") {
+            name = rest;
+            kind = DeltaLayerType::Differential;
+        } else {
+            kind = DeltaLayerType::Delta;
+        }
+
         if let Some(rest) = fname.strip_prefix("rel_") {
             parts = rest.split('_');
             rel = RelishTag::Relation(RelTag {
@@ -111,6 +129,7 @@ impl DeltaFileName {
             start_lsn,
             end_lsn,
             dropped,
+            kind,
         })
     }
 }
@@ -142,14 +161,20 @@ impl fmt::Display for DeltaFileName {
             RelishTag::ControlFile => "pg_control".to_string(),
         };
 
+        let kind_extension = match self.kind {
+            DeltaLayerType::Delta => "",
+            DeltaLayerType::Differential => ".diff",
+        };
+
         write!(
             f,
-            "{}_{}_{:016X}_{:016X}{}",
+            "{}_{}_{:016X}_{:016X}{}{}",
             basename,
             self.seg.segno,
             u64::from(self.start_lsn),
             u64::from(self.end_lsn),
-            if self.dropped { "_DROPPED" } else { "" }
+            if self.dropped { "_DROPPED" } else { "" },
+            kind_extension
         )
     }
 }

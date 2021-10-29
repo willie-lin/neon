@@ -5,7 +5,10 @@
 //! And there's another BTreeMap to track the size of the relation.
 //!
 use crate::layered_repository::ephemeral_file::EphemeralFile;
-use crate::layered_repository::filename::DeltaFileName;
+use crate::layered_repository::filename::{DeltaFileName, DeltaLayerType};
+use crate::layered_repository::layers::differential_layer::DifferentialLayer;
+use crate::layered_repository::layers::meta::differential_meta::AsLatestLsn;
+use crate::layered_repository::page_versions::{PageVersionIter, PageVersionPtr, PageVersions};
 use crate::layered_repository::storage_layer::{
     Layer, PageReconstructData, PageReconstructResult, PageVersion, SegmentTag, RELISH_SEG_SIZE,
 };
@@ -21,9 +24,8 @@ use log::*;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use zenith_utils::lsn::Lsn;
+use zenith_utils::multi_bitmap::LayeredBitmap;
 use zenith_utils::vec_map::VecMap;
-
-use super::page_versions::PageVersions;
 
 pub struct InMemoryLayer {
     conf: &'static PageServerConf,
@@ -42,10 +44,18 @@ pub struct InMemoryLayer {
 
     /// The above fields never change. The parts that do change are in 'inner',
     /// and protected by mutex.
-    inner: RwLock<InMemoryLayerInner>,
+    pub(crate) inner: RwLock<InMemoryLayerInner>,
 
     /// Predecessor layer might be needed?
     incremental: bool,
+}
+
+impl<Y: Clone> AsLatestLsn for VecMap<Lsn, Y> {
+    type Arg = ();
+
+    fn as_latest_lsn(&self, arg: &Self::Arg) -> Lsn {
+        self.as_slice().last().map(|(lsn, _)| *lsn).unwrap()
+    }
 }
 
 pub struct InMemoryLayerInner {
@@ -62,6 +72,11 @@ pub struct InMemoryLayerInner {
     /// Indexed by block number and LSN.
     ///
     page_versions: PageVersions,
+
+    ///
+    /// All blocks that were changed in earlier non-snapshot layers
+    ///
+    changes_since_snapshot: LayeredBitmap<Lsn>,
 
     ///
     /// `segsizes` tracks the size of the segment at different points in time.
@@ -89,6 +104,31 @@ impl InMemoryLayerInner {
             panic!("could not find seg size in in-memory layer");
         }
     }
+
+    pub(crate) fn get_segsizes(&self) -> &VecMap<Lsn, u32> {
+        return &self.segsizes;
+    }
+
+    pub(crate) fn changed_since_snapshot(&self) -> &LayeredBitmap<Lsn> {
+        return &self.changes_since_snapshot;
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn per_page_changes_iterator(&self) -> PageVersionIter {
+        return PageVersionIter::new(&self.page_versions);
+    }
+    pub(crate) fn page_changes_vecmap_iterator(
+        &self,
+    ) -> impl Iterator<Item = (&u32, &VecMap<Lsn, PageVersionPtr>)> {
+        return self.page_versions.page_map_iter();
+    }
+
+    pub(crate) fn get_page_version(&self, ptr: PageVersionPtr) -> PageVersion {
+        return self
+            .page_versions
+            .get_page_version(ptr)
+            .expect("Could not find page version");
+    }
 }
 
 impl Layer for InMemoryLayer {
@@ -110,6 +150,7 @@ impl Layer for InMemoryLayer {
             start_lsn: self.start_lsn,
             end_lsn,
             dropped: inner.dropped,
+            kind: DeltaLayerType::Delta,
         }
         .to_string();
 
@@ -162,21 +203,19 @@ impl Layer for InMemoryLayer {
         {
             let inner = self.inner.read().unwrap();
 
-            // Scan the page versions backwards, starting from `lsn`.
-            let iter = inner
+            let range = inner
                 .page_versions
-                .get_block_lsn_range(blknum, ..=lsn)
-                .iter()
-                .rev();
-            for (entry_lsn, pos) in iter {
+                .get_block_lsn_range(blknum, Lsn(0)..=lsn);
+            for (lsn, pos) in range.iter().rev() {
                 match &cached_img_lsn {
-                    Some(cached_lsn) if entry_lsn <= cached_lsn => {
+                    Some(cached_lsn) if lsn <= cached_lsn => {
                         return Ok(PageReconstructResult::Cached)
                     }
                     _ => {}
                 }
 
                 let pv = inner.page_versions.get_page_version(*pos)?;
+
                 match pv {
                     PageVersion::Page(img) => {
                         reconstruct_data.page_img = Some(img);
@@ -184,7 +223,7 @@ impl Layer for InMemoryLayer {
                         break;
                     }
                     PageVersion::Wal(rec) => {
-                        reconstruct_data.records.push((*entry_lsn, rec.clone()));
+                        reconstruct_data.records.push((*lsn, rec.clone()));
                         if rec.will_init {
                             // This WAL record initializes the page, so no need to go further back
                             need_image = false;
@@ -302,10 +341,40 @@ impl Layer for InMemoryLayer {
                 PageVersion::Wal(_rec) => "wal",
             };
 
-            println!("blk {} at {}: {}\n", blknum, lsn, pv_description);
+            println!(
+                "blk {} at {}: {}\n",
+                blknum as u32 + (self.seg.segno * RELISH_SEG_SIZE),
+                lsn,
+                pv_description
+            );
         }
 
         Ok(())
+    }
+
+    fn latest_page_versions_since_snapshot(
+        &self,
+    ) -> Option<Box<dyn Iterator<Item = (u32, Lsn)> + '_>> {
+        let inner = self.inner.read().unwrap();
+        let mut vec = Vec::with_capacity(inner.page_versions.get_num_blocks());
+        let iter = inner.page_versions.ordered_page_version_iter(None);
+
+        let mut blockno: Option<(u32, Lsn)> = None;
+        for (blknum, lsn, pos) in iter {
+            match blockno {
+                None => {
+                    blockno = Some((blknum, lsn));
+                }
+                Some((prev_blknum, prev_lsn)) => {
+                    if prev_blknum != blknum {
+                        vec.push((prev_blknum, prev_lsn));
+                        blockno = Some((blknum, lsn));
+                    }
+                }
+            }
+        }
+
+        Some(Box::new(vec.into_iter()))
     }
 }
 
@@ -313,6 +382,7 @@ impl Layer for InMemoryLayer {
 pub struct LayersOnDisk {
     pub delta_layers: Vec<DeltaLayer>,
     pub image_layers: Vec<ImageLayer>,
+    pub differential_layers: Vec<DifferentialLayer>,
 }
 
 impl InMemoryLayer {
@@ -359,6 +429,7 @@ impl InMemoryLayer {
                 end_lsn: None,
                 dropped: false,
                 page_versions: PageVersions::new(file),
+                changes_since_snapshot: LayeredBitmap::new(RELISH_SEG_SIZE as usize),
                 segsizes,
             }),
         })
@@ -434,17 +505,10 @@ impl InMemoryLayer {
                         gapblknum,
                         blknum
                     );
-                    let old = inner
+
+                    inner
                         .page_versions
                         .append_or_update_last(gapblknum, lsn, zeropv)?;
-                    // We already had an entry for this LSN. That's odd..
-
-                    if old.is_some() {
-                        warn!(
-                            "Page version of rel {} blk {} at {} already exists",
-                            self.seg.rel, blknum, lsn
-                        );
-                    }
                 }
 
                 inner.segsizes.append_or_update_last(lsn, newsize).unwrap();
@@ -535,6 +599,7 @@ impl InMemoryLayer {
                 end_lsn: None,
                 dropped: false,
                 page_versions: PageVersions::new(file),
+                changes_since_snapshot: LayeredBitmap::new(RELISH_SEG_SIZE as usize),
                 segsizes,
             }),
         })
@@ -562,7 +627,7 @@ impl InMemoryLayer {
                 assert!(lsn <= &end_lsn, "{:?} {:?}", lsn, end_lsn);
             }
 
-            for (_blk, lsn, _pv) in inner.page_versions.ordered_page_version_iter(None) {
+            for (_blk, lsn, _ptr) in inner.page_versions.ordered_page_version_iter(None) {
                 assert!(lsn <= end_lsn);
             }
         }
@@ -596,18 +661,9 @@ impl InMemoryLayer {
         let end_lsn_exclusive = inner.end_lsn.unwrap();
 
         if inner.dropped {
-            let delta_layer = DeltaLayer::create(
-                self.conf,
-                self.timelineid,
-                self.tenantid,
-                self.seg,
-                self.start_lsn,
-                end_lsn_exclusive,
-                true,
-                &inner.page_versions,
-                None,
-                inner.segsizes.clone(),
-            )?;
+            let segno = self.seg.segno;
+            let differential_layer =
+                DifferentialLayer::create_from_src(self.conf, timeline, true, self)?;
             trace!(
                 "freeze: created delta layer for dropped segment {} {}-{}",
                 self.seg,
@@ -615,8 +671,9 @@ impl InMemoryLayer {
                 end_lsn_exclusive
             );
             return Ok(LayersOnDisk {
-                delta_layers: vec![delta_layer],
+                delta_layers: Vec::new(),
                 image_layers: Vec::new(),
+                differential_layers: vec![*differential_layer],
             });
         }
 
@@ -626,25 +683,16 @@ impl InMemoryLayer {
         let end_lsn_inclusive = Lsn(end_lsn_exclusive.0 - 1);
 
         let mut delta_layers = Vec::new();
+        let mut differential_layers = Vec::new();
 
         if self.start_lsn != end_lsn_inclusive {
             let (segsizes, _) = inner.segsizes.split_at(&end_lsn_exclusive);
             // Write the page versions before the cutoff to disk.
-            let delta_layer = DeltaLayer::create(
-                self.conf,
-                self.timelineid,
-                self.tenantid,
-                self.seg,
-                self.start_lsn,
-                end_lsn_inclusive,
-                false,
-                &inner.page_versions,
-                Some(end_lsn_inclusive),
-                segsizes,
-            )?;
-            delta_layers.push(delta_layer);
+            let differential_layer =
+                DifferentialLayer::create_from_src(self.conf, timeline, false, self)?;
+            differential_layers.push(differential_layer);
             trace!(
-                "freeze: created delta layer {} {}-{}",
+                "freeze: created differential layer {} {}-{}",
                 self.seg,
                 self.start_lsn,
                 end_lsn_inclusive
@@ -671,6 +719,7 @@ impl InMemoryLayer {
         Ok(LayersOnDisk {
             delta_layers,
             image_layers: vec![image_layer],
+            differential_layers: vec![],
         })
     }
 }

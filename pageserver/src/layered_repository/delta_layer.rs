@@ -38,7 +38,7 @@
 //! parts: the page versions and the relation sizes. They are stored as separate chapters.
 //!
 use crate::layered_repository::blob::BlobWriter;
-use crate::layered_repository::filename::{DeltaFileName, PathOrConf};
+use crate::layered_repository::filename::{DeltaFileName, DeltaLayerType, PathOrConf};
 use crate::layered_repository::page_versions::PageVersions;
 use crate::layered_repository::storage_layer::{
     Layer, PageReconstructData, PageReconstructResult, PageVersion, SegmentTag, RELISH_SEG_SIZE,
@@ -55,6 +55,7 @@ use zenith_utils::vec_map::VecMap;
 // while being able to use std::fmt::Write's methods
 use std::fmt::Write as _;
 use std::fs;
+use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::ops::Bound::Included;
 use std::path::{Path, PathBuf};
@@ -62,6 +63,8 @@ use std::sync::{Mutex, MutexGuard};
 
 use bookfile::{Book, BookWriter};
 
+use crate::layered_repository::layers::meta::differential_meta::DifferentialMetadata;
+use crate::layered_repository::layers::meta::{LayerMetadata, MutLayerMetadata};
 use zenith_utils::bin_ser::BeSer;
 use zenith_utils::lsn::Lsn;
 
@@ -144,7 +147,7 @@ pub struct DeltaLayerInner {
 
     /// All versions of all pages in the file are are kept here.
     /// Indexed by block number and LSN.
-    page_version_metas: VecMap<(u32, Lsn), BlobRange>,
+    metadata: DifferentialMetadata<VecMap<Lsn, BlobRange>>,
 
     /// `relsizes` tracks the size of the relation at different points in time.
     relsizes: VecMap<Lsn, u32>,
@@ -221,14 +224,14 @@ impl Layer for DeltaLayer {
                 .chapter_reader(PAGE_VERSIONS_CHAPTER)?;
 
             // Scan the metadata BTreeMap backwards, starting from the given entry.
-            let minkey = (blknum, Lsn(0));
-            let maxkey = (blknum, lsn);
-            let iter = inner
-                .page_version_metas
-                .slice_range((Included(&minkey), Included(&maxkey)))
-                .iter()
-                .rev();
-            for ((_blknum, pv_lsn), blob_range) in iter {
+
+            let data = inner.metadata.get_page_data(blknum);
+            if data.is_none() {
+                return Ok(PageReconstructResult::Continue(Lsn(self.start_lsn.0 - 1)));
+            }
+
+            let iter = data.unwrap().slice_range(..=lsn).iter().rev();
+            for (pv_lsn, blob_range) in iter {
                 match &cached_img_lsn {
                     Some(cached_lsn) if pv_lsn <= cached_lsn => {
                         return Ok(PageReconstructResult::Cached)
@@ -308,7 +311,7 @@ impl Layer for DeltaLayer {
     ///
     fn unload(&self) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
-        inner.page_version_metas = VecMap::default();
+        inner.metadata = DifferentialMetadata::new(());
         inner.relsizes = VecMap::default();
         inner.loaded = false;
 
@@ -348,11 +351,11 @@ impl Layer for DeltaLayer {
         println!("--- page versions ---");
 
         let path = self.path();
-        let file = std::fs::File::open(&path)?;
+        let file = File::open(&path)?;
         let book = Book::new(file)?;
 
         let chapter = book.chapter_reader(PAGE_VERSIONS_CHAPTER)?;
-        for ((blk, lsn), blob_range) in inner.page_version_metas.as_slice() {
+        for (blk, lsn, blob_range) in inner.metadata.all_page_versions() {
             let mut desc = String::new();
 
             let buf = read_blob(&chapter, blob_range)?;
@@ -378,6 +381,23 @@ impl Layer for DeltaLayer {
         }
 
         Ok(())
+    }
+
+    fn latest_page_versions_since_snapshot(
+        &self,
+    ) -> Option<Box<dyn Iterator<Item = (u32, Lsn)> + '_>> {
+        let inner = self.inner.lock().unwrap();
+
+        let result: Vec<(u32, Lsn)> = inner
+            .metadata
+            .pages()
+            .flat_map(|(offnum, map)| {
+                let blknum = offnum as u32 + self.seg.segno * RELISH_SEG_SIZE;
+                map.as_slice().last().map(|(lsn, _)| (blknum, *lsn))
+            })
+            .collect();
+
+        return Some(Box::new(result.into_iter()));
     }
 }
 
@@ -431,7 +451,7 @@ impl DeltaLayer {
             inner: Mutex::new(DeltaLayerInner {
                 loaded: false,
                 book: None,
-                page_version_metas: VecMap::default(),
+                metadata: DifferentialMetadata::new(()),
                 relsizes,
             }),
         };
@@ -451,23 +471,39 @@ impl DeltaLayer {
         let book = BookWriter::new(buf_writer, DELTA_FILE_MAGIC)?;
 
         let mut page_version_writer = BlobWriter::new(book, PAGE_VERSIONS_CHAPTER);
+        let mut prev_blob_range = None;
 
         let page_versions_iter = page_versions.ordered_page_version_iter(cutoff);
         for (blknum, lsn, pos) in page_versions_iter {
-            let blob_range =
+            let blob_range: BlobRange =
                 page_version_writer.write_blob_from_reader(&mut page_versions.reader(pos)?)?;
 
-            inner
-                .page_version_metas
-                .append((blknum, lsn), blob_range)
-                .unwrap();
+            if let Some(prev_range) = prev_blob_range {
+                debug_assert!(blob_range.follows(&prev_range));
+            }
+
+            prev_blob_range = Some(blob_range.clone());
+
+            if let Some(map) = inner.metadata.get_page_data_mut(blknum) {
+                map.append(lsn, blob_range).unwrap();
+            } else {
+                let mut map = VecMap::default();
+                map.append(lsn, blob_range).unwrap();
+                inner.metadata.add_mutated_page(blknum, map);
+            }
         }
 
         let book = page_version_writer.close()?;
 
         // Write out page versions
         let mut chapter = book.new_chapter(PAGE_VERSION_METAS_CHAPTER);
-        let buf = VecMap::ser(&inner.page_version_metas)?;
+        let mut map = VecMap::default();
+
+        for (blockno, lsn, pv) in inner.metadata.all_page_versions() {
+            map.append((blockno, lsn), pv.clone()).unwrap();
+        }
+
+        let buf = VecMap::ser(&map)?;
         chapter.write_all(&buf)?;
         let book = chapter.close()?;
 
@@ -548,14 +584,15 @@ impl DeltaLayer {
         }
 
         let chapter = book.read_chapter(PAGE_VERSION_METAS_CHAPTER)?;
-        let page_version_metas = VecMap::des(&chapter)?;
+        let metadata: DifferentialMetadata<VecMap<Lsn, BlobRange>> =
+            VecMap::<(u32, Lsn), BlobRange>::des(&chapter)?.into();
 
         let chapter = book.read_chapter(REL_SIZES_CHAPTER)?;
         let relsizes = VecMap::des(&chapter)?;
 
         debug!("loaded from {}", &path.display());
 
-        inner.page_version_metas = page_version_metas;
+        inner.metadata = metadata;
         inner.relsizes = relsizes;
         inner.loaded = true;
 
@@ -580,7 +617,7 @@ impl DeltaLayer {
             inner: Mutex::new(DeltaLayerInner {
                 loaded: false,
                 book: None,
-                page_version_metas: VecMap::default(),
+                metadata: DifferentialMetadata::new(()),
                 relsizes: VecMap::default(),
             }),
         }
@@ -607,7 +644,7 @@ impl DeltaLayer {
             inner: Mutex::new(DeltaLayerInner {
                 loaded: false,
                 book: None,
-                page_version_metas: VecMap::default(),
+                metadata: DifferentialMetadata::new(()),
                 relsizes: VecMap::default(),
             }),
         })
@@ -619,6 +656,7 @@ impl DeltaLayer {
             start_lsn: self.start_lsn,
             end_lsn: self.end_lsn,
             dropped: self.dropped,
+            kind: DeltaLayerType::Delta,
         }
     }
 
@@ -630,5 +668,27 @@ impl DeltaLayer {
             self.tenantid,
             &self.layer_name(),
         )
+    }
+}
+
+impl Into<DifferentialMetadata<VecMap<Lsn, BlobRange>>> for VecMap<(u32, Lsn), BlobRange> {
+    fn into(self) -> DifferentialMetadata<VecMap<Lsn, BlobRange>> {
+        let mut meta = DifferentialMetadata::new(());
+        let mut entry: Option<(u32, &mut VecMap<Lsn, BlobRange>)> = None;
+
+        for ((blknum, lsn), br) in self.as_slice().into_iter() {
+            if let Some((offnum, map)) = &mut entry {
+                if *offnum == *blknum {
+                    map.append(*lsn, br.clone()).unwrap();
+                    continue;
+                }
+            }
+            let mut map = VecMap::default();
+            map.append(*lsn, br.clone()).unwrap();
+            meta.add_mutated_page(*blknum, map);
+            entry = Some((*blknum, meta.get_page_data_mut(*blknum).unwrap()))
+        }
+
+        return meta;
     }
 }

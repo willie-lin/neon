@@ -5,10 +5,16 @@ use anyhow::Result;
 use bookfile::{BookWriter, BoundedReader, ChapterId, ChapterWriter};
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct BlobRange {
     offset: u64,
     size: usize,
+}
+
+impl BlobRange {
+    pub fn follows(&self, p0: &BlobRange) -> bool {
+        self.offset == p0.offset + p0.size as u64
+    }
 }
 
 pub fn read_blob<F: FileExt>(reader: &BoundedReader<&'_ F>, range: &BlobRange) -> Result<Vec<u8>> {

@@ -18,12 +18,27 @@ use zenith_utils::{lsn::Lsn, vec_map::VecMap};
 use super::storage_layer::PageVersion;
 use crate::layered_repository::ephemeral_file::EphemeralFile;
 
+use crate::layered_repository::storage_layer::{AsVersionType, VersionType};
+use crate::repository::WALRecord;
 use zenith_utils::bin_ser::BeSer;
 
-const EMPTY_SLICE: &[(Lsn, u64)] = &[];
+const EMPTY_SLICE: &[(Lsn, PageVersionPtr)] = &[];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PageVersionPtr(u64);
+
+impl AsVersionType for PageVersionPtr {
+    fn as_version_type(&self) -> VersionType {
+        if self.0 & (1u64 << 63) != 0 {
+            VersionType::Init
+        } else {
+            VersionType::Delta
+        }
+    }
+}
 
 pub struct PageVersions {
-    map: HashMap<u32, VecMap<Lsn, u64>>,
+    map: HashMap<u32, VecMap<Lsn, PageVersionPtr>>,
 
     /// The PageVersion structs are stored in a serialized format in this file.
     /// Each serialized PageVersion is preceded by a 'u32' length field.
@@ -44,12 +59,20 @@ impl PageVersions {
         blknum: u32,
         lsn: Lsn,
         page_version: PageVersion,
-    ) -> Result<Option<u64>> {
+    ) -> Result<Option<PageVersionPtr>> {
         // remember starting position
         let pos = self.file.stream_position()?;
 
         // make room for the 'length' field by writing zeros as a placeholder.
         self.file.seek(std::io::SeekFrom::Start(pos + 4)).unwrap();
+
+        let ptr_type = match &page_version {
+            PageVersion::Page(_)
+            | PageVersion::Wal(WALRecord {
+                will_init: true, ..
+            }) => 1u64 << 63,
+            _ => 0u64,
+        };
 
         page_version.ser_into(&mut self.file).unwrap();
 
@@ -58,12 +81,17 @@ impl PageVersions {
         let lenbuf = u32::to_ne_bytes(len as u32);
         self.file.write_all_at(&lenbuf, pos)?;
 
+        let ptr = pos | ptr_type;
+
         let map = self.map.entry(blknum).or_insert_with(VecMap::default);
-        Ok(map.append_or_update_last(lsn, pos as u64).unwrap().0)
+        Ok(map
+            .append_or_update_last(lsn, PageVersionPtr(ptr))
+            .unwrap()
+            .0)
     }
 
     /// Get all [`PageVersion`]s in a block
-    fn get_block_slice(&self, blknum: u32) -> &[(Lsn, u64)] {
+    fn get_block_slice(&self, blknum: u32) -> &[(Lsn, PageVersionPtr)] {
         self.map
             .get(&blknum)
             .map(VecMap::as_slice)
@@ -71,7 +99,11 @@ impl PageVersions {
     }
 
     /// Get a range of [`PageVersions`] in a block
-    pub fn get_block_lsn_range<R: RangeBounds<Lsn>>(&self, blknum: u32, range: R) -> &[(Lsn, u64)] {
+    pub fn get_block_lsn_range<R: RangeBounds<Lsn>>(
+        &self,
+        blknum: u32,
+        range: R,
+    ) -> &[(Lsn, PageVersionPtr)] {
         self.map
             .get(&blknum)
             .map(|vec_map| vec_map.slice_range(range))
@@ -99,9 +131,10 @@ impl PageVersions {
     }
 
     /// Returns a 'Read' that reads the page version at given offset.
-    pub fn reader(&self, pos: u64) -> Result<PageVersionReader, std::io::Error> {
+    pub fn reader(&self, ptr: PageVersionPtr) -> Result<PageVersionReader, std::io::Error> {
         // read length
         let mut lenbuf = [0u8; 4];
+        let pos = ptr.0 & !(1u64 << 63);
         self.file.read_exact_at(&mut lenbuf, pos)?;
         let len = u32::from_ne_bytes(lenbuf);
 
@@ -112,9 +145,19 @@ impl PageVersions {
         })
     }
 
-    pub fn get_page_version(&self, pos: u64) -> Result<PageVersion> {
-        let mut reader = self.reader(pos)?;
+    pub fn get_page_version(&self, ptr: PageVersionPtr) -> Result<PageVersion> {
+        let mut reader = self.reader(ptr)?;
         Ok(PageVersion::des_from(&mut reader)?)
+    }
+
+    pub fn get_num_blocks(&self) -> usize {
+        self.map.len()
+    }
+
+    pub(crate) fn page_map_iter(
+        &self,
+    ) -> impl Iterator<Item = (&u32, &VecMap<Lsn, PageVersionPtr>)> {
+        return self.map.iter();
     }
 }
 
@@ -133,6 +176,37 @@ impl<'a> std::io::Read for PageVersionReader<'a> {
     }
 }
 
+pub struct PageVersionIter<'a> {
+    iter: Box<dyn Iterator<Item = (u32, Box<dyn Iterator<Item = (Lsn, PageVersion)> + 'a>)> + 'a>,
+}
+
+impl<'a> PageVersionIter<'a> {
+    pub fn new(page_versions: &'a PageVersions) -> Self {
+        let iter = page_versions.map.iter();
+
+        let mapfn = move |(lsn, ptr): &(Lsn, PageVersionPtr)| {
+            (*lsn, page_versions.get_page_version(ptr.clone()).unwrap())
+        };
+
+        let next_mapfn = move |(blckno, vec_map): (&'a u32, &'a VecMap<Lsn, PageVersionPtr>)| -> (u32, Box<dyn Iterator<Item = (Lsn, PageVersion)> + 'a>) {
+            let iter = vec_map.as_slice().iter();
+            (*blckno, Box::new(iter.map(mapfn)))
+        };
+
+        PageVersionIter {
+            iter: Box::new(iter.map(next_mapfn)),
+        }
+    }
+}
+
+impl<'a> Iterator for PageVersionIter<'a> {
+    type Item = (u32, Box<dyn Iterator<Item = (Lsn, PageVersion)> + 'a>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.iter.next()
+    }
+}
+
 pub struct OrderedPageVersionIter<'a> {
     page_versions: &'a PageVersions,
 
@@ -141,7 +215,7 @@ pub struct OrderedPageVersionIter<'a> {
 
     cutoff_lsn: Option<Lsn>,
 
-    cur_slice_iter: slice::Iter<'a, (Lsn, u64)>,
+    cur_slice_iter: slice::Iter<'a, (Lsn, PageVersionPtr)>,
 }
 
 impl OrderedPageVersionIter<'_> {
@@ -155,7 +229,7 @@ impl OrderedPageVersionIter<'_> {
 }
 
 impl<'a> Iterator for OrderedPageVersionIter<'a> {
-    type Item = (u32, Lsn, u64);
+    type Item = (u32, Lsn, PageVersionPtr);
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
