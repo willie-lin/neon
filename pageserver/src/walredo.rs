@@ -23,6 +23,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use lazy_static::lazy_static;
 use log::*;
 use nix::poll::*;
+use nix::errno::Errno::EINTR;
 use serde::Serialize;
 use std::fs;
 use std::fs::OpenOptions;
@@ -40,6 +41,7 @@ use zenith_utils::bin_ser::BeSer;
 use zenith_utils::lsn::Lsn;
 use zenith_utils::nonblock::set_nonblock;
 use zenith_utils::zid::ZTenantId;
+use zenith_utils::io_retry::*;
 
 use crate::relish::*;
 use crate::repository::WALRecord;
@@ -52,6 +54,8 @@ use postgres_ffi::nonrelfile_utils::mx_offset_to_member_offset;
 use postgres_ffi::nonrelfile_utils::transaction_id_set_status;
 use postgres_ffi::pg_constants;
 use postgres_ffi::XLogRecord;
+
+use crate::wait_events::*;
 
 ///
 /// `RelTag` + block number (`blknum`) gives us a unique id of the page in the cluster.
@@ -221,8 +225,10 @@ impl WalRedoManager for PostgresRedoManager {
 
             result = self.handle_apply_request_postgres(process, &request);
 
+            set_wait_state(WaitState::WaitingForRedoLock);
             WAL_REDO_WAIT_TIME.observe(lock_time.duration_since(start_time).as_secs_f64());
             end_time = Instant::now();
+            set_wait_state(WaitState::Processing);
             WAL_REDO_TIME.observe(end_time.duration_since(lock_time).as_secs_f64());
 
             // If something went wrong, don't try to reuse the process. Kill it, and
@@ -583,7 +589,7 @@ impl PostgresRedoProcess {
         // we can, before calling poll(). That skips one call to poll() if the stdin is
         // already available for writing, which it almost certainly is because the
         // process is idle.
-        let mut nwrite = self.stdin.write(&writebuf)?;
+        let mut nwrite = write_retry(&mut self.stdin, &writebuf)?;
 
         // We expect the WAL redo process to respond with an 8k page image. We read it
         // into this buffer.
@@ -604,7 +610,20 @@ impl PostgresRedoProcess {
             // If we have more data to write, wake up if 'stdin' becomes writeable or
             // we have data to read. Otherwise only wake up if there's data to read.
             let nfds = if nwrite < writebuf.len() { 3 } else { 2 };
-            let n = nix::poll::poll(&mut pollfds[0..nfds], TIMEOUT.as_millis() as i32)?;
+            set_wait_state(WaitState::WaitingForRedo);
+            let result = nix::poll::poll(&mut pollfds[0..nfds], TIMEOUT.as_millis() as i32);
+            set_wait_state(WaitState::Processing);
+
+            let n = match result {
+                Ok(n) => n,
+                Err(err) => {
+                    if err == EINTR {
+                        continue;
+                    }
+                    result?;
+                    panic!("not reachable");
+                }
+            };
 
             if n == 0 {
                 return Err(Error::new(ErrorKind::Other, "WAL redo timed out"));
@@ -614,7 +633,7 @@ impl PostgresRedoProcess {
             let err_revents = pollfds[1].revents().unwrap();
             if err_revents & (PollFlags::POLLERR | PollFlags::POLLIN) != PollFlags::empty() {
                 let mut errbuf: [u8; 16384] = [0; 16384];
-                let n = self.stderr.read(&mut errbuf)?;
+                let n = read_retry(&mut self.stderr, &mut errbuf)?;
 
                 // The message might not be split correctly into lines here. But this is
                 // good enough, the important thing is to get the message to the log.
@@ -639,7 +658,7 @@ impl PostgresRedoProcess {
             if nwrite < writebuf.len() {
                 let in_revents = pollfds[2].revents().unwrap();
                 if in_revents & (PollFlags::POLLERR | PollFlags::POLLOUT) != PollFlags::empty() {
-                    nwrite += self.stdin.write(&writebuf[nwrite..])?;
+                    nwrite += write_retry(&mut self.stdin, &writebuf[nwrite..])?;
                 } else if in_revents.contains(PollFlags::POLLHUP) {
                     // We still have more data to write, but the process closed the pipe.
                     return Err(Error::new(
@@ -652,7 +671,7 @@ impl PostgresRedoProcess {
             // If we have some data in stdout, read it to the result buffer.
             let out_revents = pollfds[0].revents().unwrap();
             if out_revents & (PollFlags::POLLERR | PollFlags::POLLIN) != PollFlags::empty() {
-                nresult += self.stdout.read(&mut resultbuf[nresult..])?;
+                nresult += read_retry(&mut self.stdout, &mut resultbuf[nresult..])?;
             } else if out_revents.contains(PollFlags::POLLHUP) {
                 return Err(Error::new(
                     ErrorKind::BrokenPipe,

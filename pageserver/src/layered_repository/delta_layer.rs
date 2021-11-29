@@ -67,6 +67,8 @@ use zenith_utils::lsn::Lsn;
 
 use super::blob::{read_blob, BlobRange};
 
+use crate::wait_events::*;
+
 // Magic constant to identify a Zenith delta file
 pub const DELTA_FILE_MAGIC: u32 = 0x5A616E01;
 
@@ -223,7 +225,9 @@ impl Layer for DeltaLayer {
                     _ => {}
                 }
 
+                set_wait_state(WaitState::ReadingDelta);
                 let pv = PageVersion::des(&read_blob(&page_version_reader, blob_range)?)?;
+                set_wait_state(WaitState::Processing);
 
                 match pv {
                     PageVersion::Page(img) => {
@@ -415,7 +419,7 @@ impl DeltaLayer {
             end_lsn,
             dropped,
             inner: RwLock::new(DeltaLayerInner {
-                loaded: true,
+                loaded: false,
                 book: None,
                 page_version_metas: VecMap::default(),
                 relsizes,
@@ -440,8 +444,10 @@ impl DeltaLayer {
 
         let page_versions_iter = page_versions.ordered_page_version_iter(cutoff);
         for (blknum, lsn, pos) in page_versions_iter {
+            set_wait_state(WaitState::WritingDelta);
             let blob_range =
                 page_version_writer.write_blob_from_reader(&mut page_versions.reader(pos)?)?;
+            set_wait_state(WaitState::Processing);
 
             inner
                 .page_version_metas
@@ -454,13 +460,17 @@ impl DeltaLayer {
         // Write out page versions
         let mut chapter = book.new_chapter(PAGE_VERSION_METAS_CHAPTER);
         let buf = VecMap::ser(&inner.page_version_metas)?;
+        set_wait_state(WaitState::WritingDelta);
         chapter.write_all(&buf)?;
+        set_wait_state(WaitState::Processing);
         let book = chapter.close()?;
 
         // and relsizes to separate chapter
         let mut chapter = book.new_chapter(REL_SIZES_CHAPTER);
         let buf = VecMap::ser(&inner.relsizes)?;
+        set_wait_state(WaitState::WritingDelta);
         chapter.write_all(&buf)?;
+        set_wait_state(WaitState::Processing);
         let book = chapter.close()?;
 
         let mut chapter = book.new_chapter(SUMMARY_CHAPTER);
@@ -479,7 +489,9 @@ impl DeltaLayer {
 
         // This flushes the underlying 'buf_writer'.
         let writer = book.close()?;
+        set_wait_state(WaitState::SyncingDelta);
         writer.get_ref().sync_all()?;
+        set_wait_state(WaitState::Processing);
 
         trace!("saved {}", &path.display());
 
@@ -526,8 +538,10 @@ impl DeltaLayer {
 
         match &self.path_or_conf {
             PathOrConf::Conf(_) => {
+                set_wait_state(WaitState::ReadingDelta);
                 let chapter = book.read_chapter(SUMMARY_CHAPTER)?;
                 let actual_summary = Summary::des(&chapter)?;
+                set_wait_state(WaitState::Processing);
 
                 let expected_summary = Summary::from(self);
 
@@ -549,20 +563,20 @@ impl DeltaLayer {
             }
         }
 
+        set_wait_state(WaitState::ReadingDelta);
         let chapter = book.read_chapter(PAGE_VERSION_METAS_CHAPTER)?;
         let page_version_metas = VecMap::des(&chapter)?;
 
         let chapter = book.read_chapter(REL_SIZES_CHAPTER)?;
         let relsizes = VecMap::des(&chapter)?;
+        set_wait_state(WaitState::Processing);
 
         debug!("loaded from {}", &path.display());
 
-        *inner = DeltaLayerInner {
-            loaded: true,
-            book: Some(book),
-            page_version_metas,
-            relsizes,
-        };
+        inner.loaded = true;
+        inner.book = Some(book);
+        inner.page_version_metas = page_version_metas;
+        inner.relsizes = relsizes;
 
         Ok(())
     }

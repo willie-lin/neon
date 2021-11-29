@@ -21,6 +21,7 @@ pub mod restore_local_repo;
 pub mod tenant_mgr;
 pub mod tenant_threads;
 pub mod virtual_file;
+pub mod wait_events;
 pub mod waldecoder;
 pub mod walreceiver;
 pub mod walredo;
@@ -49,6 +50,8 @@ pub mod defaults {
     pub const DEFAULT_OPEN_MEM_LIMIT: usize = 128 * 1024 * 1024;
     pub const DEFAULT_PAGE_CACHE_SIZE: usize = 8192;
     pub const DEFAULT_MAX_FILE_DESCRIPTORS: usize = 100;
+
+    pub const DEFAULT_IMAGE_DISTANCE: f32 = 1.0;
 }
 
 lazy_static! {

@@ -45,6 +45,8 @@ use bookfile::{Book, BookWriter};
 use zenith_utils::bin_ser::BeSer;
 use zenith_utils::lsn::Lsn;
 
+use crate::wait_events::*;
+
 // Magic constant to identify a Zenith segment image file
 pub const IMAGE_FILE_MAGIC: u32 = 0x5A616E01 + 1;
 
@@ -174,7 +176,9 @@ impl Layer for ImageLayer {
                     .as_ref()
                     .unwrap()
                     .chapter_reader(BLOCKY_IMAGES_CHAPTER)?;
+                set_wait_state(WaitState::ReadingImage);
                 chapter.read_exact_at(&mut buf, offset)?;
+                set_wait_state(WaitState::Processing);
 
                 buf
             }
@@ -313,17 +317,22 @@ impl ImageLayer {
                 let mut chapter = book.new_chapter(BLOCKY_IMAGES_CHAPTER);
                 for block_bytes in base_images {
                     assert_eq!(block_bytes.len(), BLOCK_SIZE);
+                    set_wait_state(WaitState::WritingImage);
                     chapter.write_all(&block_bytes)?;
+                    set_wait_state(WaitState::Processing);
                 }
                 chapter.close()?
             }
             ImageType::NonBlocky => {
                 let mut chapter = book.new_chapter(NONBLOCKY_IMAGE_CHAPTER);
+                set_wait_state(WaitState::WritingImage);
                 chapter.write_all(&base_images[0])?;
+                set_wait_state(WaitState::Processing);
                 chapter.close()?
             }
         };
 
+        set_wait_state(WaitState::WritingImage);
         let mut chapter = book.new_chapter(SUMMARY_CHAPTER);
         let summary = Summary {
             tenantid,
@@ -334,10 +343,13 @@ impl ImageLayer {
         };
         Summary::ser_into(&summary, &mut chapter)?;
         let book = chapter.close()?;
+        set_wait_state(WaitState::Processing);
 
         // This flushes the underlying 'buf_writer'.
+        set_wait_state(WaitState::SyncingImage);
         let writer = book.close()?;
         writer.get_ref().sync_all()?;
+        set_wait_state(WaitState::Processing);
 
         trace!("saved {}", path.display());
 
@@ -428,8 +440,10 @@ impl ImageLayer {
 
         match &self.path_or_conf {
             PathOrConf::Conf(_) => {
+                set_wait_state(WaitState::ReadingImage);
                 let chapter = book.read_chapter(SUMMARY_CHAPTER)?;
                 let actual_summary = Summary::des(&chapter)?;
+                set_wait_state(WaitState::Processing);
 
                 let expected_summary = Summary::from(self);
 

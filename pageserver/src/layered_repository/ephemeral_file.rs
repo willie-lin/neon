@@ -17,6 +17,8 @@ use std::sync::{Arc, RwLock};
 use zenith_utils::zid::ZTenantId;
 use zenith_utils::zid::ZTimelineId;
 
+use crate::wait_events::*;
+
 use std::os::unix::fs::FileExt;
 
 lazy_static! {
@@ -77,9 +79,11 @@ impl EphemeralFile {
     pub fn fill_buffer(&self, buf: &mut [u8], blkno: u32) -> Result<(), Error> {
         let mut off = 0;
         while off < PAGE_SZ {
+            set_wait_state(WaitState::ReadingEphemeral);
             let n = self
                 .file
                 .read_at(&mut buf[off..], blkno as u64 * PAGE_SZ as u64 + off as u64)?;
+            set_wait_state(WaitState::Processing);
 
             if n == 0 {
                 // Reached EOF. Fill the rest of the buffer with zeros.
@@ -142,9 +146,12 @@ impl FileExt for EphemeralFile {
             }
             WriteBufResult::NotFound(guard) => {
                 // Read the page from disk into the buffer
-                // TODO: if we're overwriting the whole page, no need to read it in first
                 write_guard = guard;
-                self.fill_buffer(write_guard.deref_mut(), blkno)?;
+                if off == 0 && len == PAGE_SZ {
+                    // we're overwriting the whole page, so no need to read it in first
+                } else {
+                    self.fill_buffer(write_guard.deref_mut(), blkno)?;
+                }
                 write_guard.mark_valid();
 
                 // And then fall through to modify it.
@@ -217,7 +224,9 @@ impl Drop for EphemeralFile {
 
 pub fn writeback(file_id: u64, blkno: u32, buf: &[u8]) -> Result<(), std::io::Error> {
     if let Some(file) = EPHEMERAL_FILES.read().unwrap().files.get(&file_id) {
+        set_wait_state(WaitState::WritingEphemeral);
         file.write_all_at(buf, blkno as u64 * PAGE_SZ as u64)?;
+        set_wait_state(WaitState::Processing);
         Ok(())
     } else {
         Err(std::io::Error::new(

@@ -75,6 +75,11 @@ impl LayerMap {
             .and_then(|layer_id| GLOBAL_LAYER_MAP.read().unwrap().get(&layer_id))
     }
 
+    pub fn image_distance(&self, tag: &SegmentTag) -> Option<u64> {
+        let segentry = self.segs.get(tag)?;
+        Some(segentry.image_distance())
+    }
+
     ///
     /// Insert an open in-memory layer
     ///
@@ -309,6 +314,18 @@ impl SegEntry {
         }
 
         self.historic.search(lsn)
+    }
+
+    pub fn image_distance(&self) -> u64 {
+        let mut iter = self.historic.iter();
+        let mut count = 0;
+        while let Some(layer) = iter.next_back() {
+            if !layer.is_incremental() {
+                break;
+            }
+            count += 1;
+        }
+        count
     }
 
     pub fn newer_image_layer_exists(&self, lsn: Lsn) -> bool {

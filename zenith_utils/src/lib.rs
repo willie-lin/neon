@@ -47,6 +47,8 @@ pub mod tcp_listener;
 // Utility for putting a raw file descriptor into non-blocking mode
 pub mod nonblock;
 
+pub mod io_retry;
+
 // This is a shortcut to embed git sha into binaries and avoid copying the same build script to all packages
 //
 // we have several cases:

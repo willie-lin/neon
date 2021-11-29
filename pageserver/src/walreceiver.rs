@@ -34,6 +34,8 @@ use zenith_utils::lsn::Lsn;
 use zenith_utils::zid::ZTenantId;
 use zenith_utils::zid::ZTimelineId;
 
+use crate::wait_events::*;
+
 //
 // We keep one WAL Receiver active per timeline.
 //
@@ -139,6 +141,8 @@ fn thread_main(conf: &'static PageServerConf, timelineid: ZTimelineId, tenantid:
     let _enter = info_span!("WAL receiver", timeline = %timelineid, tenant = %tenantid).entered();
     info!("WAL receiver thread started");
 
+    set_i_am_walreceiver();
+
     let mut retry_count = 10;
 
     //
@@ -237,7 +241,14 @@ fn walreceiver_main(
     let mut checkpoint = CheckPoint::decode(&checkpoint_bytes)?;
     trace!("CheckPoint.nextXid = {}", checkpoint.nextXid.value);
 
+    set_wait_state(WaitState::Receiving);
+
+    //let pprof_guard = pprof::ProfilerGuard::new(100).unwrap();
+
     while let Some(replication_message) = physical_stream.next()? {
+        set_wait_state(WaitState::Processing);
+        //pprof_guard.start();
+        
         let status_update = match replication_message {
             ReplicationMessage::XLogData(xlog_data) => {
                 // Pass the WAL data to the decoder, and see if we can decode
@@ -331,13 +342,18 @@ fn walreceiver_main(
             let apply_lsn = PgLsn::from(0);
             let ts = SystemTime::now();
             const NO_REPLY: u8 = 0;
+            set_wait_state(WaitState::Sending);
             physical_stream.standby_status_update(write_lsn, flush_lsn, apply_lsn, ts, NO_REPLY)?;
+            set_wait_state(WaitState::Processing);
         }
 
         if tenant_mgr::shutdown_requested() {
             debug!("stop walreceiver because pageserver shutdown is requested");
             break;
         }
+
+        set_wait_state(WaitState::Receiving);
+        //pprof_guard.stop();
     }
 
     Ok(())

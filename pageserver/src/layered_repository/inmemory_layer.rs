@@ -193,6 +193,14 @@ impl Layer for InMemoryLayer {
                     }
                 }
             }
+
+            // If we didn't find any records for this, check if the request beyond EOF
+            if need_image && reconstruct_data.records.is_empty() && self.seg.rel.is_blocky() &&
+                 blknum - self.seg.segno * RELISH_SEG_SIZE >= self.get_seg_size(lsn)?
+            {
+                return Ok(PageReconstructResult::Missing(self.start_lsn))
+            }
+
             // release lock on 'inner'
         }
 
@@ -566,7 +574,7 @@ impl InMemoryLayer {
     /// WAL records between start and end LSN. (The delta layer is not needed
     /// when a new relish is created with a single LSN, so that the start and
     /// end LSN are the same.)
-    pub fn write_to_disk(&self, timeline: &LayeredTimeline) -> Result<LayersOnDisk> {
+    pub fn write_to_disk(&self, timeline: &LayeredTimeline, write_image: bool) -> Result<LayersOnDisk> {
         trace!(
             "write_to_disk {} get_end_lsn is {}",
             self.filename().display(),
@@ -613,7 +621,12 @@ impl InMemoryLayer {
         // Since `end_lsn` is inclusive, subtract 1.
         // We want to make an ImageLayer for the last included LSN,
         // so the DeltaLayer should exclude that LSN.
-        let end_lsn_inclusive = Lsn(end_lsn_exclusive.0 - 1);
+
+        let end_lsn_inclusive = if write_image {
+            Lsn(end_lsn_exclusive.0 - 1)
+        } else {
+           Lsn(end_lsn_exclusive.0)
+         };
 
         let mut delta_layers = Vec::new();
 
@@ -650,17 +663,23 @@ impl InMemoryLayer {
         drop(inner);
 
         // Write a new base image layer at the cutoff point
-        let image_layer =
-            ImageLayer::create_from_src(self.conf, timeline, self, end_lsn_inclusive)?;
-        trace!(
-            "freeze: created image layer {} at {}",
-            self.seg,
-            end_lsn_inclusive
-        );
-
-        Ok(LayersOnDisk {
-            delta_layers,
-            image_layers: vec![image_layer],
-        })
+        if write_image {
+            let image_layer =
+                ImageLayer::create_from_src(self.conf, timeline, self, end_lsn_inclusive)?;
+            trace!(
+                "freeze: created image layer {} at {}",
+                self.seg,
+                end_lsn_inclusive
+            );
+            Ok(LayersOnDisk {
+                delta_layers,
+                image_layers: vec![image_layer],
+            })
+        } else {
+            Ok(LayersOnDisk {
+                delta_layers,
+                image_layers: vec![],
+            })
+        }
     }
 }

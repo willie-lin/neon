@@ -42,6 +42,7 @@ use std::{
     sync::{
         atomic::{AtomicU8, AtomicUsize, Ordering},
         RwLock, RwLockReadGuard, RwLockWriteGuard,
+        Mutex,
     },
 };
 
@@ -94,6 +95,7 @@ const MAX_USAGE_COUNT: u8 = 5;
 ///
 #[derive(Debug, PartialEq, Eq, Clone)]
 enum CacheKey {
+    Vacant,
     MaterializedPage {
         hash_key: MaterializedPageHashKey,
         lsn: Lsn,
@@ -102,6 +104,12 @@ enum CacheKey {
         file_id: u64,
         blkno: u32,
     },
+}
+
+impl CacheKey {
+    fn is_vacant(&self) -> bool {
+        matches!(self, CacheKey::Vacant)
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
@@ -124,7 +132,7 @@ struct Slot {
 }
 
 struct SlotInner {
-    key: Option<CacheKey>,
+    key: CacheKey,
     buf: &'static mut [u8; PAGE_SZ],
     dirty: bool,
 }
@@ -177,6 +185,8 @@ pub struct PageCache {
 
     ephemeral_page_map: RwLock<HashMap<(u64, u32), usize>>,
 
+    free_list: Mutex<Vec<usize>>,
+
     /// The actual buffers with their metadata.
     slots: Box<[Slot]>,
 
@@ -214,6 +224,8 @@ pub struct PageWriteGuard<'i> {
 
     // Are the page contents currently valid?
     valid: bool,
+
+    slot_idx: usize,
 }
 
 impl std::ops::DerefMut for PageWriteGuard<'_> {
@@ -233,7 +245,7 @@ impl std::ops::Deref for PageWriteGuard<'_> {
 impl PageWriteGuard<'_> {
     /// Mark that the buffer contents are now valid.
     pub fn mark_valid(&mut self) {
-        assert!(self.inner.key.is_some());
+        assert!(!self.inner.key.is_vacant());
         assert!(
             !self.valid,
             "mark_valid called on a buffer that was already valid"
@@ -244,7 +256,7 @@ impl PageWriteGuard<'_> {
         // only ephemeral pages can be dirty ATM.
         assert!(matches!(
             self.inner.key,
-            Some(CacheKey::EphemeralPage { .. })
+            CacheKey::EphemeralPage { .. }
         ));
         self.inner.dirty = true;
     }
@@ -257,11 +269,12 @@ impl Drop for PageWriteGuard<'_> {
     /// initializing it, remove the mapping from the page cache.
     ///
     fn drop(&mut self) {
-        assert!(self.inner.key.is_some());
+        assert!(!self.inner.key.is_vacant());
         if !self.valid {
-            let self_key = self.inner.key.as_ref().unwrap();
-            PAGE_CACHE.get().unwrap().remove_mapping(self_key);
-            self.inner.key = None;
+            let page_cache = PAGE_CACHE.get().unwrap();
+            page_cache.remove_mapping(&self.inner.key);
+            page_cache.insert_to_free_list(self.slot_idx);
+            self.inner.key = CacheKey::Vacant;
             self.inner.dirty = false;
         }
     }
@@ -375,16 +388,15 @@ impl PageCache {
             let slot = &self.slots[slot_idx];
 
             let mut inner = slot.inner.write().unwrap();
-            if let Some(key) = &inner.key {
-                match key {
-                    CacheKey::EphemeralPage { file_id, blkno: _ } if *file_id == drop_file_id => {
-                        // remove mapping for old buffer
-                        self.remove_mapping(key);
-                        inner.key = None;
-                        inner.dirty = false;
-                    }
-                    _ => {}
+            match inner.key {
+                CacheKey::EphemeralPage { file_id, blkno: _ } if file_id == drop_file_id => {
+                    // remove mapping for old buffer
+                    self.remove_mapping(&inner.key);
+                    self.insert_to_free_list(slot_idx);
+                    inner.key = CacheKey::Vacant;
+                    inner.dirty = false;
                 }
+                _ => {}
             }
         }
     }
@@ -414,7 +426,7 @@ impl PageCache {
             // lock already, another thread could have evicted the page)
             let slot = &self.slots[slot_idx];
             let inner = slot.inner.read().unwrap();
-            if inner.key.as_ref() == Some(cache_key) {
+            if inner.key == *cache_key {
                 slot.inc_usage_count();
                 return Some(PageReadGuard(inner));
             } else {
@@ -481,13 +493,14 @@ impl PageCache {
 
             // Make the slot ready
             let slot = &self.slots[slot_idx];
-            inner.key = Some(cache_key.clone());
+            inner.key = cache_key.clone();
             inner.dirty = false;
             slot.usage_count.store(1, Ordering::Relaxed);
 
             return ReadBufResult::NotFound(PageWriteGuard {
                 inner,
                 valid: false,
+                slot_idx,
             });
         }
     }
@@ -503,9 +516,9 @@ impl PageCache {
             // lock already, another thread could have evicted the page)
             let slot = &self.slots[slot_idx];
             let inner = slot.inner.write().unwrap();
-            if inner.key.as_ref() == Some(cache_key) {
+            if inner.key == *cache_key {
                 slot.inc_usage_count();
-                return Some(PageWriteGuard { inner, valid: true });
+                return Some(PageWriteGuard { inner, valid: true, slot_idx });
             }
         }
         None
@@ -542,13 +555,14 @@ impl PageCache {
 
             // Make the slot ready
             let slot = &self.slots[slot_idx];
-            inner.key = Some(cache_key.clone());
+            inner.key = cache_key.clone();
             inner.dirty = false;
             slot.usage_count.store(1, Ordering::Relaxed);
 
             return WriteBufResult::NotFound(PageWriteGuard {
                 inner,
                 valid: false,
+                slot_idx,
             });
         }
     }
@@ -586,6 +600,9 @@ impl PageCache {
                 let map = self.ephemeral_page_map.read().unwrap();
                 Some(*map.get(&(*file_id, *blkno))?)
             }
+            CacheKey::Vacant => {
+                panic!("cannot search for vacant key");
+            }
         }
     }
 
@@ -608,6 +625,9 @@ impl PageCache {
             CacheKey::EphemeralPage { file_id, blkno } => {
                 let map = self.ephemeral_page_map.read().unwrap();
                 Some(*map.get(&(*file_id, *blkno))?)
+            }
+            CacheKey::Vacant => {
+                panic!("cannot search for vacant key");
             }
         }
     }
@@ -640,7 +660,15 @@ impl PageCache {
                 map.remove(&(*file_id, *blkno))
                     .expect("could not find old key in mapping");
             }
+            CacheKey::Vacant => {
+                panic!("cannot remove vacant key");
+            }
         }
+    }
+
+    fn insert_to_free_list(&self, slot_idx: usize) {
+        let mut free_list = self.free_list.lock().unwrap();
+        free_list.push(slot_idx);
     }
 
     ///
@@ -680,6 +708,9 @@ impl PageCache {
                     }
                 }
             }
+            CacheKey::Vacant => {
+                panic!("cannot insert with vacant key");
+            }
         }
     }
 
@@ -691,42 +722,66 @@ impl PageCache {
     ///
     /// On return, the slot is empty and write-locked.
     fn find_victim(&self) -> (usize, RwLockWriteGuard<SlotInner>) {
+
         let iter_limit = self.slots.len() * 2;
-        let mut iters = 0;
-        loop {
-            let slot_idx = self.next_evict_slot.fetch_add(1, Ordering::Relaxed) % self.slots.len();
+        'outer: loop {
 
-            let slot = &self.slots[slot_idx];
+            // Try to grab a slot from the free list first
+            {
+                let mut free_list = self.free_list.lock().unwrap();
 
-            if slot.dec_usage_count() == 0 || iters >= iter_limit {
-                let mut inner = slot.inner.write().unwrap();
+                if let Some(slot_idx) = free_list.pop() {
+                    drop(free_list);
+                    let slot = &self.slots[slot_idx];
+                    let inner = slot.inner.write().unwrap();
 
-                if let Some(old_key) = &inner.key {
-                    if inner.dirty {
-                        if let Err(err) = Self::writeback(old_key, inner.buf) {
-                            // Writing the page to disk failed.
-                            //
-                            // FIXME: What to do here, when? We could propagate the error to the
-                            // caller, but victim buffer is generally unrelated to the original
-                            // call. It can even belong to a different tenant. Currently, we
-                            // report the error to the log and continue the clock sweep to find
-                            // a different victim. But if the problem persists, the page cache
-                            // could fill up with dirty pages that we cannot evict, and we will
-                            // loop retrying the writebacks indefinitely.
-                            error!("writeback of buffer {:?} failed: {}", old_key, err);
-                            continue;
-                        }
-                    }
-
-                    // remove mapping for old buffer
-                    self.remove_mapping(old_key);
-                    inner.dirty = false;
-                    inner.key = None;
+                    assert!(inner.key.is_vacant());
+                    return (slot_idx, inner);
                 }
-                return (slot_idx, inner);
             }
 
-            iters += 1;
+            let mut iters = 0;
+            loop {
+                let slot_idx = self.next_evict_slot.fetch_add(1, Ordering::Relaxed) % self.slots.len();
+
+                let slot = &self.slots[slot_idx];
+
+                if slot.dec_usage_count() == 0 || iters >= iter_limit {
+                    let mut inner = slot.inner.write().unwrap();
+
+                    if inner.key.is_vacant() {
+                        // We should get vacant slots through the free list
+                        continue 'outer;
+                    } else {
+                        if inner.dirty {
+                            if let Err(err) = Self::writeback(&inner.key, inner.buf) {
+                                // Writing the page to disk failed.
+                                //
+                                // FIXME: What to do here, when? We could propagate the error to the
+                                // caller, but victim buffer is generally unrelated to the original
+                                // call. It can even belong to a different tenant. Currently, we
+                                // report the error to the log and continue the clock sweep to find
+                                // a different victim. But if the problem persists, the page cache
+                                // could fill up with dirty pages that we cannot evict, and we will
+                                // loop retrying the writebacks indefinitely.
+                                error!("writeback of buffer {:?} failed: {}", inner.key, err);
+                                continue;
+                            }
+                        }
+
+                        // remove mapping for old buffer
+                        self.remove_mapping(&inner.key);
+
+                        // Mark it as vacant, but don't return to the free list because we're
+                        // taking it immediately into use.
+                        inner.key = CacheKey::Vacant;
+                        inner.dirty = false;
+                    }
+                    return (slot_idx, inner);
+                }
+
+                iters += 1;
+            }
         }
     }
 
@@ -737,6 +792,9 @@ impl PageCache {
                 lsn: _,
             } => {
                 panic!("unexpected dirty materialized page");
+            }
+            CacheKey::Vacant => {
+                panic!("unexpected dirty vacant page");
             }
             CacheKey::EphemeralPage { file_id, blkno } => {
                 writeback_ephemeral_file(*file_id, *blkno, buf)
@@ -759,7 +817,7 @@ impl PageCache {
 
                 Slot {
                     inner: RwLock::new(SlotInner {
-                        key: None,
+                        key: CacheKey::Vacant,
                         buf,
                         dirty: false,
                     }),
@@ -768,9 +826,12 @@ impl PageCache {
             })
             .collect();
 
+        let free_list = (0..num_pages).collect();
+
         Self {
             materialized_page_map: Default::default(),
             ephemeral_page_map: Default::default(),
+            free_list: Mutex::new(free_list),
             slots,
             next_evict_slot: AtomicUsize::new(0),
         }

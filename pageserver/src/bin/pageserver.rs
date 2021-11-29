@@ -524,6 +524,9 @@ fn start_pageserver(conf: &'static PageServerConf) -> Result<()> {
         flag::register(*sig, Arc::clone(&term_now))?;
     }
 
+    let mut sigs = vec![SIGUSR1, SIGUSR2];
+    sigs.extend(TERM_SIGNALS);
+
     // TODO: Check that it looks like a valid repository before going further
 
     // bind sockets before daemonizing so we report errors early and do not return until we are listening
@@ -558,6 +561,9 @@ fn start_pageserver(conf: &'static PageServerConf) -> Result<()> {
             Err(err) => error!(%err, "could not daemonize"),
         }
     }
+
+    let pprof_guard = pprof::ProfilerGuard::new(100).unwrap();
+    pprof_guard.stop();
 
     // keep join handles for spawned threads
     // don't spawn threads before daemonizing
@@ -600,7 +606,7 @@ fn start_pageserver(conf: &'static PageServerConf) -> Result<()> {
             page_service::thread_main(conf, auth, pageserver_listener, conf.auth_type)
         })?;
 
-    for info in SignalsInfo::<WithOrigin>::new(TERM_SIGNALS)?.into_iter() {
+    for info in SignalsInfo::<WithOrigin>::new(sigs)?.into_iter() {
         match info.signal {
             SIGQUIT => {
                 info!("Got SIGQUIT. Terminate pageserver in immediate shutdown mode");
@@ -630,6 +636,22 @@ fn start_pageserver(conf: &'static PageServerConf) -> Result<()> {
                 }
                 info!("Pageserver shut down successfully completed");
                 exit(0);
+            }
+            SIGUSR1 =>  {
+                info!("Received SIGUSR1");
+                if let Ok(report) = pprof_guard.report().build() {
+                    let file = std::fs::File::create("/tmp/flamegraph.svg").unwrap();
+                    let mut options = pprof::flamegraph::Options::default();
+                    options.image_width = Some(3000);
+                    report.flamegraph_with_options(file, &mut options).unwrap();
+                    info!("Flamegraph generated");
+                };
+            }
+            SIGUSR2 =>  {
+                info!("Received SIGUSR2");
+                if let Ok(_) = pprof_guard.reset() {
+                    info!("cpu profiler reset");
+                };
             }
             unknown_signal => {
                 debug!("Unknown signal {}", unknown_signal);

@@ -19,6 +19,8 @@ use std::sync::{RwLock, RwLockWriteGuard};
 
 use once_cell::sync::OnceCell;
 
+use zenith_utils::io_retry::*;
+
 ///
 /// A virtual file descriptor. You can use this just like std::fs::File, but internally
 /// the underlying file is closed if the system is low on file descriptors,
@@ -357,11 +359,11 @@ impl Seek for VirtualFile {
 
 impl FileExt for VirtualFile {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize, Error> {
-        self.with_file(|file| file.read_at(buf, offset))?
+        self.with_file(|file| read_at_retry(file, buf, offset))?
     }
 
     fn write_at(&self, buf: &[u8], offset: u64) -> Result<usize, Error> {
-        self.with_file(|file| file.write_at(buf, offset))?
+        self.with_file(|file| write_at_retry(file, buf, offset))?
     }
 }
 

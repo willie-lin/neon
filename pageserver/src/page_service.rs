@@ -284,10 +284,13 @@ impl PageServerHandler {
         /* switch client to COPYBOTH */
         pgb.write_message(&BeMessage::CopyBothResponse)?;
 
+        let pprof_guard = pprof::ProfilerGuard::new(100).unwrap();
+
         while !tenant_mgr::shutdown_requested() {
             match pgb.read_message() {
                 Ok(message) => {
                     if let Some(message) = message {
+                        //pprof_guard.start();
                         trace!("query: {:?}", message);
 
                         let copy_data_bytes = match message {
@@ -325,6 +328,7 @@ impl PageServerHandler {
                         });
 
                         pgb.write_message(&BeMessage::CopyData(&response.serialize()))?;
+                        pprof_guard.stop();
                     } else {
                         break;
                     }

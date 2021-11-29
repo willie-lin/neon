@@ -28,7 +28,7 @@ use std::io::Write;
 use std::ops::{Bound::Included, Deref};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{self, AtomicUsize};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant};
 
 use self::metadata::{metadata_path, TimelineMetadata};
@@ -521,7 +521,7 @@ pub struct LayeredTimeline {
     tenantid: ZTenantId,
     timelineid: ZTimelineId,
 
-    layers: Mutex<LayerMap>,
+    layers: RwLock<LayerMap>,
 
     // WAL redo manager
     walredo_mgr: Arc<dyn WalRedoManager + Sync + Send>,
@@ -746,7 +746,7 @@ impl Timeline for LayeredTimeline {
         // We will filter dropped relishes below.
         //
         loop {
-            let rels = timeline.layers.lock().unwrap().list_relishes(tag, lsn)?;
+            let rels = timeline.layers.read().unwrap().list_relishes(tag, lsn)?;
 
             for (&new_relish, &new_relish_exists) in rels.iter() {
                 match all_relishes_map.entry(new_relish) {
@@ -914,7 +914,7 @@ impl LayeredTimeline {
             conf,
             timelineid,
             tenantid,
-            layers: Mutex::new(LayerMap::default()),
+            layers: RwLock::new(LayerMap::default()),
 
             walredo_mgr,
 
@@ -944,7 +944,7 @@ impl LayeredTimeline {
     /// Returns all timeline-related files that were found and loaded.
     ///
     fn load_layer_map(&self, disk_consistent_lsn: Lsn) -> anyhow::Result<Vec<PathBuf>> {
-        let mut layers = self.layers.lock().unwrap();
+        let mut layers = self.layers.write().unwrap();
         let mut num_layers = 0;
         let (imgfilenames, deltafilenames) =
             filename::list_files(self.conf, self.timelineid, self.tenantid)?;
@@ -980,8 +980,8 @@ impl LayeredTimeline {
             // before crash.
             if filename.end_lsn > disk_consistent_lsn + 1 {
                 warn!(
-                    "found future delta layer {} on timeline {}",
-                    filename, self.timelineid
+                    "found future delta layer {} on timeline {}, disk_consistent_lsn {}",
+                    filename, self.timelineid, disk_consistent_lsn
                 );
 
                 rename_to_backup(timeline_path.join(filename.to_string()))?;
@@ -1028,7 +1028,7 @@ impl LayeredTimeline {
         seg: SegmentTag,
         lsn: Lsn,
     ) -> Result<Option<(Arc<dyn Layer>, Lsn)>> {
-        let self_layers = self.layers.lock().unwrap();
+        let self_layers = self.layers.read().unwrap();
         self.get_layer_for_read_locked(seg, lsn, &self_layers)
     }
 
@@ -1044,7 +1044,7 @@ impl LayeredTimeline {
         &self,
         seg: SegmentTag,
         lsn: Lsn,
-        self_layers: &MutexGuard<LayerMap>,
+        self_layers: &LayerMap,
     ) -> Result<Option<(Arc<dyn Layer>, Lsn)>> {
         trace!("get_layer_for_read called for {} at {}", seg, lsn);
 
@@ -1061,9 +1061,9 @@ impl LayeredTimeline {
 
         // Now we have the right starting timeline for our search.
         loop {
-            let layers_owned: MutexGuard<LayerMap>;
+            let layers_owned: RwLockReadGuard<LayerMap>;
             let layers = if self as *const LayeredTimeline != timeline as *const LayeredTimeline {
-                layers_owned = timeline.layers.lock().unwrap();
+                layers_owned = timeline.layers.read().unwrap();
                 &layers_owned
             } else {
                 self_layers
@@ -1109,7 +1109,7 @@ impl LayeredTimeline {
     /// Get a handle to the latest layer for appending.
     ///
     fn get_layer_for_write(&self, seg: SegmentTag, lsn: Lsn) -> Result<Arc<InMemoryLayer>> {
-        let mut layers = self.layers.lock().unwrap();
+        let mut layers = self.layers.write().unwrap();
 
         assert!(lsn.is_aligned());
 
@@ -1214,8 +1214,10 @@ impl LayeredTimeline {
     ///
     /// NOTE: This has nothing to do with checkpoint in PostgreSQL.
     fn checkpoint_internal(&self, checkpoint_distance: u64) -> Result<()> {
+        let pprof_guard = pprof::ProfilerGuard::new(100).unwrap();
+        pprof_guard.start();
         let mut write_guard = self.write_lock.lock().unwrap();
-        let mut layers = self.layers.lock().unwrap();
+        let mut layers = self.layers.write().unwrap();
 
         // Bump the generation number in the layer map, so that we can distinguish
         // entries inserted after the checkpoint started
@@ -1273,19 +1275,24 @@ impl LayeredTimeline {
             let mut this_layer_uploads = self.evict_layer(oldest_layer_id)?;
             layer_uploads.append(&mut this_layer_uploads);
 
-            write_guard = self.write_lock.lock().unwrap();
-            layers = self.layers.lock().unwrap();
-        }
+            drop(oldest_layer);
 
-        // Call unload() on all frozen layers, to release memory.
-        // This shouldn't be much memory, as only metadata is slurped
-        // into memory.
-        for layer in layers.iter_historic_layers() {
-            layer.unload()?;
+            write_guard = self.write_lock.lock().unwrap();
+            layers = self.layers.write().unwrap();
         }
 
         drop(layers);
         drop(write_guard);
+
+        // Call unload() on all frozen layers, to release memory.
+        // This shouldn't be much memory, as only metadata is slurped
+        // into memory.
+        {
+            let layers = self.layers.read().unwrap();
+            for layer in layers.iter_historic_layers() {
+                layer.unload()?;
+            }
+        }
 
         if !layer_uploads.is_empty() {
             // We must fsync the timeline dir to ensure the directory entries for
@@ -1338,6 +1345,7 @@ impl LayeredTimeline {
             // Also update the in-memory copy
             self.disk_consistent_lsn.store(disk_consistent_lsn);
         }
+        pprof_guard.stop();
 
         Ok(())
     }
@@ -1349,7 +1357,7 @@ impl LayeredTimeline {
         // original load, as we may have released the write lock since then.
 
         let mut write_guard = self.write_lock.lock().unwrap();
-        let mut layers = self.layers.lock().unwrap();
+        let mut layers = self.layers.write().unwrap();
 
         let mut layer_uploads = Vec::new();
 
@@ -1363,14 +1371,16 @@ impl LayeredTimeline {
             layers.remove_open(layer_id);
             layers.insert_historic(oldest_layer.clone());
 
+            let image_distance = layers.image_distance(&oldest_layer.get_seg_tag()).unwrap_or(0);
+
             // Write the now-frozen layer to disk. That could take a while, so release the lock while do it
             drop(layers);
             drop(write_guard);
 
-            let new_historics = oldest_layer.write_to_disk(self)?;
+            let new_historics = oldest_layer.write_to_disk(self, image_distance > 5)?;
 
             write_guard = self.write_lock.lock().unwrap();
-            layers = self.layers.lock().unwrap();
+            layers = self.layers.write().unwrap();
 
             // Finally, replace the frozen in-memory layer with the new on-disk layers
             layers.remove_historic(oldest_layer);
@@ -1437,7 +1447,7 @@ impl LayeredTimeline {
         // 3. newer on-disk layer exists (only for non-dropped segments);
         // 4. this layer doesn't serve as a tombstone for some older layer;
         //
-        let mut layers = self.layers.lock().unwrap();
+        let mut layers = self.layers.write().unwrap();
         'outer: for l in layers.iter_historic_layers() {
             // This layer is in the process of being flushed to disk.
             // It will be swapped out of the layer map, replaced with
@@ -1700,8 +1710,8 @@ impl LayeredTimeline {
                             // We landed on the same layer again. Shouldn't happen, but if it does,
                             // don't get stuck in an infinite loop.
                             bail!(
-                                "could not find predecessor layer of segment {} at {}",
-                                seg.rel,
+                                "could not find predecessor of layer {} at {}, layer returned its own LSN",
+                                layer_ref.filename().display(),
                                 cont_lsn
                             );
                         }
@@ -1710,9 +1720,13 @@ impl LayeredTimeline {
                         curr_lsn = cont_lsn;
                         continue;
                     } else {
+                        error!("could not find predecessor layer {} at {}",
+                               layer_ref.filename().display(),
+                               cont_lsn
+                        );
                         bail!(
-                            "could not find predecessor layer of segment {} at {}",
-                            seg.rel,
+                            "could not find predecessor layer {} at {}",
+                            layer_ref.filename().display(),
                             cont_lsn
                         );
                     }
