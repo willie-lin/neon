@@ -290,7 +290,7 @@ impl PageServerHandler {
             match pgb.read_message() {
                 Ok(message) => {
                     if let Some(message) = message {
-                        //pprof_guard.start();
+                        pprof_guard.start();
                         trace!("query: {:?}", message);
 
                         let copy_data_bytes = match message {

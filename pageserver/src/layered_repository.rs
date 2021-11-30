@@ -238,16 +238,20 @@ impl Repository for LayeredRepository {
     }
 
     fn checkpoint_iteration(&self, cconf: CheckpointConfig) -> Result<()> {
+        let timelines_to_checkpoint: Vec<(ZTimelineId, Arc<LayeredTimeline>)>;
         {
             let timelines = self.timelines.lock().unwrap();
+            timelines_to_checkpoint =  timelines.iter().map(|(timelineid, timeline)| {
+                (*timelineid, timeline.clone())
+            }).collect();
+        }
 
-            for (timelineid, timeline) in timelines.iter() {
-                let _entered =
-                    info_span!("checkpoint", timeline = %timelineid, tenant = %self.tenantid)
-                        .entered();
+        for (timelineid, timeline) in timelines_to_checkpoint.iter() {
+            let _entered =
+                info_span!("checkpoint", timeline = %timelineid, tenant = %self.tenantid)
+                .entered();
 
-                timeline.checkpoint(cconf)?;
-            }
+            timeline.checkpoint(cconf)?;
         }
 
         Ok(())
@@ -1215,7 +1219,7 @@ impl LayeredTimeline {
     /// NOTE: This has nothing to do with checkpoint in PostgreSQL.
     fn checkpoint_internal(&self, checkpoint_distance: u64) -> Result<()> {
         let pprof_guard = pprof::ProfilerGuard::new(100).unwrap();
-        pprof_guard.start();
+        //pprof_guard.start();
         let mut write_guard = self.write_lock.lock().unwrap();
         let mut layers = self.layers.write().unwrap();
 
