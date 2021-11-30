@@ -38,7 +38,7 @@ use std::convert::TryInto;
 use std::fs;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use bookfile::{Book, BookWriter};
 
@@ -94,7 +94,7 @@ pub struct ImageLayer {
     // This entry contains an image of all pages as of this LSN
     pub lsn: Lsn,
 
-    inner: Mutex<ImageLayerInner>,
+    inner: RwLock<ImageLayerInner>,
 }
 
 #[derive(Clone)]
@@ -288,12 +288,12 @@ impl ImageLayer {
             tenantid,
             seg,
             lsn,
-            inner: Mutex::new(ImageLayerInner {
+            inner: RwLock::new(ImageLayerInner {
                 book: None,
                 image_type: image_type.clone(),
             }),
         };
-        let inner = layer.inner.lock().unwrap();
+        let inner = layer.inner.write().unwrap();
 
         // Write the images into a file
         //
@@ -385,16 +385,37 @@ impl ImageLayer {
     }
 
     ///
-    /// Load the contents of the file into memory
+    /// Open the underlying file and read the metadata into memory, if it's
+    /// not loaded already.
     ///
-    fn load(&self) -> Result<MutexGuard<ImageLayerInner>> {
-        // quick exit if already loaded
-        let mut inner = self.inner.lock().unwrap();
+    fn load(&self) -> Result<RwLockReadGuard<ImageLayerInner>> {
+        loop {
+            // Quick exit if already loaded
+            let inner = self.inner.read().unwrap();
+            if inner.book.is_some() {
+                return Ok(inner);
+            }
 
-        if inner.book.is_some() {
-            return Ok(inner);
+            // Need to open the file and load the metadata. Upgrade our lock to
+            // a write lock. (Or rather, release and re-lock in write mode.)
+            drop(inner);
+            let inner = self.inner.write().unwrap();
+            if inner.book.is_none() {
+                self.load_inner(inner)?;
+            } else {
+                // Another thread loaded it while we were not holding the lock.
+            }
+
+            // We now have the file open and loaded. There's no function to do
+            // that in the std library RwLock, so we have to release and re-lock
+            // in read mode. (To be precise, the lock guard was moved in the
+            // above call to `load_inner`, so it's already been released). And
+            // while we do that, another thread could unload again, so we have
+            // to re-check and retry if that happens.
         }
+    }
 
+    fn load_inner(&self, mut inner: RwLockWriteGuard<ImageLayerInner>) -> Result<()> {
         let path = self.path();
         let file = VirtualFile::open(&path)
             .with_context(|| format!("Failed to open virtual file '{}'", path.display()))?;
@@ -448,7 +469,7 @@ impl ImageLayer {
             image_type,
         };
 
-        Ok(inner)
+        Ok(())
     }
 
     /// Create an ImageLayer struct representing an existing file on disk
@@ -464,7 +485,7 @@ impl ImageLayer {
             tenantid,
             seg: filename.seg,
             lsn: filename.lsn,
-            inner: Mutex::new(ImageLayerInner {
+            inner: RwLock::new(ImageLayerInner {
                 book: None,
                 image_type: ImageType::Blocky { num_blocks: 0 },
             }),
@@ -487,7 +508,7 @@ impl ImageLayer {
             tenantid: summary.tenantid,
             seg: summary.seg,
             lsn: summary.lsn,
-            inner: Mutex::new(ImageLayerInner {
+            inner: RwLock::new(ImageLayerInner {
                 book: None,
                 image_type: ImageType::Blocky { num_blocks: 0 },
             }),

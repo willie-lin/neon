@@ -58,7 +58,7 @@ use std::fs;
 use std::io::{BufWriter, Write};
 use std::ops::Bound::Included;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
 
 use bookfile::{Book, BookWriter};
 
@@ -132,7 +132,7 @@ pub struct DeltaLayer {
 
     dropped: bool,
 
-    inner: Mutex<DeltaLayerInner>,
+    inner: RwLock<DeltaLayerInner>,
 }
 
 pub struct DeltaLayerInner {
@@ -293,11 +293,16 @@ impl Layer for DeltaLayer {
     /// it will need to be loaded back.
     ///
     fn unload(&self) -> Result<()> {
-        let mut inner = self.inner.lock().unwrap();
-        inner.page_version_metas = VecMap::default();
-        inner.relsizes = VecMap::default();
-        inner.loaded = false;
-        Ok(())
+        match self.inner.try_write() {
+            Ok(mut inner) => {
+                inner.page_version_metas = VecMap::default();
+                inner.relsizes = VecMap::default();
+                inner.loaded = false;
+                Ok(())
+            }
+            Err(TryLockError::WouldBlock) => Ok(()),
+            Err(TryLockError::Poisoned(_)) => panic!("DeltaLayer lock was poisoned"),
+        }
     }
 
     fn delete(&self) -> Result<()> {
@@ -409,14 +414,14 @@ impl DeltaLayer {
             start_lsn,
             end_lsn,
             dropped,
-            inner: Mutex::new(DeltaLayerInner {
+            inner: RwLock::new(DeltaLayerInner {
                 loaded: true,
                 book: None,
                 page_version_metas: VecMap::default(),
                 relsizes,
             }),
         };
-        let mut inner = delta_layer.inner.lock().unwrap();
+        let mut inner = delta_layer.inner.write().unwrap();
 
         // Write the data into a file
         //
@@ -484,16 +489,37 @@ impl DeltaLayer {
     }
 
     ///
-    /// Load the contents of the file into memory
+    /// Open the underlying file and read the metadata into memory, if it's
+    /// not loaded already.
     ///
-    fn load(&self) -> Result<MutexGuard<DeltaLayerInner>> {
-        // quick exit if already loaded
-        let mut inner = self.inner.lock().unwrap();
+    fn load(&self) -> Result<RwLockReadGuard<DeltaLayerInner>> {
+        loop {
+            // Quick exit if already loaded
+            let inner = self.inner.read().unwrap();
+            if inner.loaded {
+                return Ok(inner);
+            }
 
-        if inner.loaded {
-            return Ok(inner);
+            // Need to open the file and load the metadata. Upgrade our lock to
+            // a write lock. (Or rather, release and re-lock in write mode.)
+            drop(inner);
+            let inner = self.inner.write().unwrap();
+            if !inner.loaded {
+                self.load_inner(inner)?;
+            } else {
+                // Another thread loaded it while we were not holding the lock.
+            }
+
+            // We now have the file open and loaded. There's no function to do
+            // that in the std library RwLock, so we have to release and re-lock
+            // in read mode. (To be precise, the lock guard was moved in the
+            // above call to `load_inner`, so it's already been released). And
+            // while we do that, another thread could unload again, so we have
+            // to re-check and retry if that happens.
         }
+    }
 
+    fn load_inner(&self, mut inner: RwLockWriteGuard<DeltaLayerInner>) -> Result<()> {
         let path = self.path();
         let file = VirtualFile::open(&path)?;
         let book = Book::new(file)?;
@@ -538,7 +564,7 @@ impl DeltaLayer {
             relsizes,
         };
 
-        Ok(inner)
+        Ok(())
     }
 
     /// Create a DeltaLayer struct representing an existing file on disk.
@@ -556,7 +582,7 @@ impl DeltaLayer {
             start_lsn: filename.start_lsn,
             end_lsn: filename.end_lsn,
             dropped: filename.dropped,
-            inner: Mutex::new(DeltaLayerInner {
+            inner: RwLock::new(DeltaLayerInner {
                 loaded: false,
                 book: None,
                 page_version_metas: VecMap::default(),
@@ -583,7 +609,7 @@ impl DeltaLayer {
             start_lsn: summary.start_lsn,
             end_lsn: summary.end_lsn,
             dropped: summary.dropped,
-            inner: Mutex::new(DeltaLayerInner {
+            inner: RwLock::new(DeltaLayerInner {
                 loaded: false,
                 book: None,
                 page_version_metas: VecMap::default(),
