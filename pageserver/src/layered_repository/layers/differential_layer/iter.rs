@@ -8,12 +8,15 @@ use crate::layered_repository::layers::differential_layer::LineagePointer;
 use crate::layered_repository::layers::LAYER_PAGE_SIZE;
 use crate::layered_repository::storage_layer::PageVersion;
 use crate::repository::WALRecord;
+use anyhow::{Result};
 use bytes::Bytes;
 use parking_lot::RwLock;
 use std::fs::File;
-use std::mem::{align_of, size_of};
-use std::num::NonZeroU32;
+use core::mem::{align_of, size_of};
+use core::num::NonZeroU32;
+use hyper::Version;
 use zenith_utils::lsn::Lsn;
+use crate::read_from_file;
 
 const VERSIONS_PER_PAGE: usize = LAYER_PAGE_SIZE / size_of::<VersionInfo>();
 const BRANCHINFOS_PER_PAGE: usize = LAYER_PAGE_SIZE / size_of::<LineageBranchInfo>();
@@ -28,10 +31,12 @@ pub struct LineageBranchVersionIterator<'a> {
     file: &'a File,
     branch: LineageBranchInfo,
     versionarray_index: Option<usize>,
-    current_data_offset: (u32, u16),
-    next_version_infos_block: u32,
+    current_data_file_offset: usize,
+    next_version_infos_file_offset: usize,
     version_infos_buf: Vec<VersionInfo>,
-    version_infos_buf_start: usize,
+    version_infos_buf_first_version_offset: usize,
+    data_buf: Vec<u8>,
+    data_buf_first_unused: usize,
     n_total_versions: usize,
 }
 
@@ -40,34 +45,30 @@ impl<'a> LineageBranchVersionIterator<'a> {
         LineageBranchVersionIterator {
             file,
             branch,
-            next_version_infos_block: 0,
+            next_version_infos_file_offset: branch.branch_ptr_data.item_ptr.full_offset(),
             versionarray_index: None,
-            current_data_offset: (0, 0),
+            current_data_file_offset: 0usize,
             version_infos_buf: vec![],
-            version_infos_buf_start: 0,
+            version_infos_buf_first_version_offset: 0,
+            data_buf: vec![],
+            data_buf_first_unused: 0,
             n_total_versions: 0,
         }
     }
 
-    fn update_version_infos_buffer(&mut self) {
-        let my_buf: RwLock<BufPage> = RwLock::new(BufPage::default());
-        self.version_infos_buf_start += self.version_infos_buf.len();
-        let buf = get_buf(self.file, self.next_version_infos_block, &my_buf);
+    fn update_version_infos_buffer(&mut self) -> Result<()> {
+        self.version_infos_buf_first_version_offset += self.version_infos_buf.len();
+        let n_local_recs = VERSIONS_PER_PAGE.min(self.n_total_versions - self.version_infos_buf_first_version_offset);
+        self.version_infos_buf.resize(n_local_recs, VersionInfo::default());
 
-        let n_local_recs =
-            VERSIONS_PER_PAGE.min(self.n_total_versions - self.version_infos_buf_start);
-        let versions_arr = {
-            let (versions_data, _) = buf.data().split_at(n_local_recs * size_of::<VersionInfo>());
-            let (head, arr, tail) = unsafe { versions_data.align_to::<VersionInfo>() };
-            assert!(head.is_empty());
-            assert!(tail.is_empty());
-            assert_eq!(arr.len(), n_local_recs);
-            arr
-        };
+        {
+            let file = self.file;
+            let read_buf = &mut self.version_infos_buf[..];
+            read_from_file!(file, self.next_version_infos_file_offset, read_buf []);
+        }
 
-        self.version_infos_buf.clear();
-        self.version_infos_buf.extend_from_slice(versions_arr);
-        self.next_version_infos_block += 1;
+        self.next_version_infos_file_offset += 1;
+        Ok(())
     }
 
     /// Returns the LSN of the lsn that will be returned at the next next() call.
@@ -79,13 +80,13 @@ impl<'a> LineageBranchVersionIterator<'a> {
             if index >= self.n_total_versions {
                 return None;
             }
-            let local_offset = index - self.version_infos_buf_start;
+            let local_offset = index - self.version_infos_buf_first_version_offset;
 
             if local_offset >= self.version_infos_buf.len() {
                 self.update_version_infos_buffer();
             }
 
-            let local_offset = index - self.version_infos_buf_start;
+            let local_offset = index - self.version_infos_buf_first_version_offset;
 
             Some(Lsn(u64::from_ne_bytes(
                 self.version_infos_buf[local_offset].lsn,
@@ -105,8 +106,6 @@ impl<'a> Iterator for LineageBranchVersionIterator<'a> {
             Wal(WalInitiatedLineageBranchHeader),
         }
 
-        let mut my_buf: RwLock<BufPage> = RwLock::new(BufPage::default());
-
         impl InitializedBranch {
             fn num_items(&self) -> NonZeroU32 {
                 match self {
@@ -123,187 +122,187 @@ impl<'a> Iterator for LineageBranchVersionIterator<'a> {
             }
         }
 
+        let mut data_buf = vec![0u8; LAYER_PAGE_SIZE];
+        let mut data_buf_mut = &mut data_buf[..];
+
         match self.versionarray_index {
             // Initializing the iterator, returning the oldest record of the branch
             None => {
                 self.versionarray_index = Some(0);
                 let branch_hdr_ptr = self.branch.branch_ptr_data.item_ptr;
 
-                let mut blockno = branch_hdr_ptr.blockno();
-                let mut offset = branch_hdr_ptr.offset();
-
-                let mut buf = get_buf(self.file, blockno, &my_buf);
-                let (_, my_data) = buf.data().split_at(branch_hdr_ptr.offset() as usize);
-
                 let typ: InitializedBranch;
-                let versions_arr: &[u8];
+                let mut offset = branch_hdr_ptr.full_offset();
 
-                match self.branch.branch_ptr_data.typ {
+                match branch.branch_ptr_data.typ {
                     BranchPtrType::PageImage => {
-                        let (hdr, data) =
-                            my_data.split_at(size_of::<PageOnlyLineageBranchHeader>());
-                        let hdr = {
-                            let (head, arr, tail) =
-                                unsafe { hdr.align_to::<PageOnlyLineageBranchHeader>() };
-                            assert!(head.is_empty());
-                            assert!(tail.is_empty());
-                            assert_eq!(arr.len(), 1);
-                            arr[0]
-                        };
+                        let mut header = PageOnlyLineageBranchHeader::default();
 
-                        offset += size_of::<PageOnlyLineageBranchHeader>() as u16;
-                        let mut bytes = vec![0u8; u32::from(hdr.length) as usize];
+                        {
+                            let res = read_from_file!(self.file, offset, header, data_buf_mut []);
+                            offset = res?;
+                        }
 
-                        let _ = read_slice_from_blocky_file(
-                            self.file, blockno, offset, &mut bytes, &mut buf, &my_buf,
-                        );
+                        if header.length as usize <= LAYER_PAGE_SIZE {
+                            return Some((
+                                self.branch.start_lsn,
+                                PageVersion::Page(Bytes::from(Box::new(data_buf[..header.length as usize]))),
+                            ))
+                        }
+
+                        data_buf.resize(header.length as usize, 0u8);
+                        let data_buf_mut = &mut data_buf[LAYER_PAGE_SIZE..];
+                        {
+                            let res = read_from_file!(self.file, offset, data_buf_mut []);
+                            offset = res?;
+                        }
                         return Some((
                             self.branch.start_lsn,
-                            PageVersion::Page(Bytes::from(bytes)),
+                            PageVersion::Page(Bytes::from(data_buf)),
                         ));
                     }
                     BranchPtrType::WalRecord => {
-                        let (hdr, data) = my_data.split_at(size_of::<WalOnlyLineageBranchHeader>());
+                        let mut header = WalOnlyLineageBranchHeader::default();
 
-                        let hdr = {
-                            let (head, arr, tail) =
-                                unsafe { hdr.align_to::<WalOnlyLineageBranchHeader>() };
-                            assert!(head.is_empty());
-                            assert!(tail.is_empty());
-                            assert_eq!(arr.len(), 1);
-                            arr[0]
-                        };
-
-                        debug_assert!(hdr.length >= hdr.main_data_offset);
-
-                        offset += size_of::<WalOnlyLineageBranchHeader>() as u16;
-                        let mut bytes = vec![0u8; u32::from(hdr.length) as usize];
-
-                        let _ = read_slice_from_blocky_file(
-                            self.file,
-                            blockno,
-                            offset,
-                            &mut bytes[..],
-                            &mut buf,
-                            &my_buf,
-                        );
+                        {
+                            let res = read_from_file!(self.file, offset, header, data_buf_mut []);
+                            offset = res?;
+                        }
+                        if header.length <= LAYER_PAGE_SIZE {
+                            return Some((
+                                self.branch.start_lsn,
+                                PageVersion::Wal(WALRecord {
+                                    will_init: true,
+                                    rec: Bytes::from(Box::new(data_buf[..header.length as usize])),
+                                    main_data_offset: header.main_data_offset
+                                }),
+                            ))
+                        }
+                        data_buf.resize(header.length as usize, 0u8);
+                        let data_buf_mut = &mut data_buf[LAYER_PAGE_SIZE..];
+                        {
+                            let res = read_from_file!(self.file, offset, data_buf_mut []);
+                            offset = res?;
+                        }
                         return Some((
                             self.branch.start_lsn,
                             PageVersion::Wal(WALRecord {
                                 will_init: true,
-                                rec: Bytes::from(bytes),
-                                main_data_offset: hdr.main_data_offset,
+                                rec: Bytes::from(data_buf),
+                                main_data_offset: header.main_data_offset
                             }),
                         ));
                     }
                     BranchPtrType::PageInitiatedBranch => {
-                        let (hdr, data) =
-                            my_data.split_at(size_of::<PageInitiatedLineageBranchHeader>());
-                        let hdr = {
-                            let (head, arr, tail) =
-                                unsafe { hdr.align_to::<PageInitiatedLineageBranchHeader>() };
-                            assert!(head.is_empty());
-                            assert!(tail.is_empty());
-                            assert_eq!(arr.len(), 1);
-                            arr[0]
-                        };
+                        let mut header = PageInitiatedLineageBranchHeader::default();
 
-                        offset += size_of::<PageInitiatedLineageBranchHeader>() as u16;
-                        self.next_version_infos_block = blockno;
-                        self.n_total_versions = u32::from(hdr.num_entries) as usize;
+                        {
+                            let res = read_from_file!(self.file, offset, header, data_buf_mut []);
+                            offset = res?;
+                        }
 
-                        typ = InitializedBranch::Page(hdr);
-                        versions_arr = data;
+                        self.n_total_versions = header.num_entries as usize;
+
+                        let n_local_versions = self.n_total_versions.min(VERSIONS_PER_PAGE);
+                        let (entries, tail) = data_buf_mut.split_at_mut(n_local_versions * LAYER_PAGE_SIZE);
+                        data_buf_mut = tail;
+
+                        self.next_version_infos_file_offset = branch_hdr_ptr.full_offset()
+                            + size_of::<PageInitiatedLineageBranchHeader>()
+                            + entries.len();
+
+                        let (head, data, tail) = unsafe { entries.align_to::<VersionInfo>() };
+
+                        debug_assert_eq!(head.len(), 0);
+                        debug_assert_eq!(tail.len(), 0);
+                        debug_assert_eq!(data.len(), n_local_versions);
+
+                        self.version_infos_buf.extend_from_slice(data);
+
+                        self.current_data_file_offset = self.branch.branch_ptr_data.item_ptr.full_offset()
+                            + size_of::<PageInitiatedLineageBranchHeader>()
+                            + self.n_total_versions * size_of::<VersionInfo>();
+
+                        typ = InitializedBranch::Page(header);
                     }
                     BranchPtrType::WalInitiatedBranch => {
-                        let (hdr, data) =
-                            my_data.split_at(size_of::<WalInitiatedLineageBranchHeader>());
-                        let hdr = {
-                            let (head, arr, tail) =
-                                unsafe { hdr.align_to::<WalInitiatedLineageBranchHeader>() };
-                            assert!(head.is_empty());
-                            assert!(tail.is_empty());
-                            assert_eq!(arr.len(), 1);
-                            arr[0]
-                        };
+                        let mut header = WalInitiatedLineageBranchHeader::default();
 
-                        debug_assert!(hdr.head.length >= hdr.head.main_data_offset);
+                        {
+                            let res = read_from_file!(self.file, offset, header, data_buf_mut []);
+                            offset = res?;
+                        }
 
-                        offset += size_of::<WalInitiatedLineageBranchHeader>() as u16;
-                        self.next_version_infos_block = blockno;
-                        self.n_total_versions = u32::from(hdr.num_entries) as usize;
+                        self.n_total_versions = header.num_entries as usize;
 
-                        typ = InitializedBranch::Wal(hdr);
-                        versions_arr = data;
-                    }
-                };
+                        let n_local_versions = self.n_total_versions.min(VERSIONS_PER_PAGE);
+                        let (entries, tail) = data_buf_mut.split_at_mut(n_local_versions * LAYER_PAGE_SIZE);
+                        data_buf_mut = tail;
+                        self.next_version_infos_file_offset = branch_hdr_ptr.full_offset()
+                            + size_of::<WalInitiatedLineageBranchHeader>()
+                            + entries.len();
+                        let (head, data, tail) = unsafe { entries.align_to::<VersionInfo>() };
 
-                // Initialize the local version infos buffer.
-                {
-                    self.version_infos_buf_start = 0;
+                        debug_assert_eq!(head.len(), 0);
+                        debug_assert_eq!(tail.len(), 0);
+                        debug_assert_eq!(data.len(), n_local_versions);
 
-                    self.next_version_infos_block = blockno + 1;
+                        self.version_infos_buf.extend_from_slice(data);
 
-                    let n_local_versions =
-                        (LAYER_PAGE_SIZE - offset as usize) / size_of::<VersionInfo>();
+                        self.current_data_file_offset = self.branch.branch_ptr_data.item_ptr.full_offset()
+                            + size_of::<WalInitiatedLineageBranchHeader>()
+                            + self.n_total_versions * size_of::<VersionInfo>();
 
-                    self.version_infos_buf.reserve(
-                        self.n_total_versions
-                            .min(n_local_versions.max(self.n_total_versions - n_local_versions))
-                            .min(VERSIONS_PER_PAGE),
-                    );
-
-                    assert_eq!(versions_arr.len() % align_of::<VersionInfo>(), 0);
-
-                    let (versions_data, tail) =
-                        versions_arr.split_at(n_local_versions * size_of::<VersionInfo>());
-
-                    let versions_arr = {
-                        let (head, arr, tail) = unsafe { versions_data.align_to::<VersionInfo>() };
-                        assert!(head.is_empty());
-                        assert!(tail.is_empty());
-                        assert_eq!(arr.len(), n_local_versions);
-                        arr
-                    };
-
-                    self.version_infos_buf.clear();
-                    self.version_infos_buf.extend_from_slice(versions_arr);
-
-                    let n_non_local = self.n_total_versions - self.version_infos_buf.len();
-
-                    if n_non_local > 0 {
-                        let pages = n_non_local / VERSIONS_PER_PAGE;
-                        blockno = self.next_version_infos_block + (pages as u32);
-                        offset =
-                            ((n_non_local % VERSIONS_PER_PAGE) * size_of::<VersionInfo>()) as u16;
-                        self.current_data_offset = (blockno, offset);
-                    } else {
-                        self.current_data_offset = (blockno, (LAYER_PAGE_SIZE - tail.len()) as u16);
+                        typ = InitializedBranch::Wal(header);
                     }
                 }
 
-                let mut buf = get_buf(self.file, self.current_data_offset.0, &my_buf);
-                let mut record_data = vec![0u8; u32::from(typ.data_len()) as usize];
+                if (typ.data_len() as usize) < data_buf_mut.len() && self.n_total_versions == self.version_infos_buf.len() {
+                    let bytes = Bytes::from(data_buf_mut.to_vec());
+                    return Some((
+                        self.branch.start_lsn,
+                        match typ {
+                            InitializedBranch::Page(_) => {
+                                PageVersion::Page(bytes)
+                            }
+                            InitializedBranch::Wal(header) => {
+                                PageVersion::Wal(WALRecord {
+                                    will_init: true,
+                                    rec: bytes,
+                                    main_data_offset: header.head.main_data_offset,
+                                })
+                            }
+                        },
+                    ));
+                }
 
-                self.current_data_offset = read_slice_from_blocky_file(
-                    self.file,
-                    self.current_data_offset.0,
-                    self.current_data_offset.1,
-                    &mut record_data,
-                    &mut buf,
-                    &my_buf,
-                );
+                self.data_buf = data_buf;
 
-                let version = match typ {
-                    InitializedBranch::Page(_) => PageVersion::Page(Bytes::from(record_data)),
-                    InitializedBranch::Wal(hdr) => PageVersion::Wal(WALRecord {
-                        will_init: true,
-                        rec: Bytes::from(record_data),
-                        main_data_offset: hdr.head.main_data_offset,
-                    }),
-                };
+                if typ.data_len() <= data_buf_mut.len() && self.n_total_versions == n_local_versions {
+                    return Some((
+                        self.branch.start_lsn,
+                        PageVersion::Page(Bytes::from(Box::new(data_buf_mut[..header.length as usize]))),
+                    ))
+                }
 
-                return Some((self.branch.start_lsn, version));
+                // The buf is emptied and resized to contain the record data, plus
+                // potentially some extra space for subsequent record data (if available)
+                //
+                // Note that this can read past the end of this branch's data, and thus past the end of the file.
+                self.data_buf.resize(LAYER_PAGE_SIZE.max(typ.data_len() as usize), 0u8);
+
+                {
+                    offset = self.current_data_file_offset;
+                    let data_buf_mut = &mut self.data_buf[..];
+                    let res = read_from_file!(self.file, offset, data_buf_mut []);
+                    self.current_data_file_offset = res?;
+                }
+                self.data_buf_first_unused = typ.data_len() as usize;
+
+                return Some((
+                    self.branch.start_lsn,
+                    PageVersion::Page(Bytes::from(Box::new(self.data_buf[..typ.data_len()]))),
+                ));
             }
             Some(index) => {
                 // If we're at the end of the versions of this branch, we are done.
@@ -311,7 +310,7 @@ impl<'a> Iterator for LineageBranchVersionIterator<'a> {
                     return None;
                 }
 
-                let local_index = index - self.version_infos_buf_start;
+                let local_index = index - self.version_infos_buf_first_version_offset;
 
                 // If the local version info buffer is all used up, we need to read more.
                 if local_index >= self.version_infos_buf.len() {
@@ -319,25 +318,34 @@ impl<'a> Iterator for LineageBranchVersionIterator<'a> {
                 }
 
                 // recalculate in case we updated the buffer
-                let local_index = index - self.version_infos_buf_start;
+                let local_index = index - self.version_infos_buf_first_version_offset;
                 let version_info = &self.version_infos_buf[local_index];
-                let mut buf = get_buf(self.file, self.current_data_offset.0, &my_buf);
-                let mut record_data = vec![0u8; u32::from(version_info.length) as usize];
-                self.current_data_offset = read_slice_from_blocky_file(
-                    self.file,
-                    self.current_data_offset.0,
-                    self.current_data_offset.1,
-                    &mut record_data,
-                    &mut buf,
-                    &my_buf,
-                );
+
+                if version_info.length > self.data_buf.len() - self.data_buf_first_unused {
+                    self.data_buf.resize(LAYER_PAGE_SIZE.max(version_info.length as usize), 0u8);
+
+                    {
+                        let offset = self.current_data_file_offset;
+                        let data_buf_mut = &mut self.data_buf[..];
+
+                        let res = read_from_file!(self.file, offset, data_buf_mut []);
+                        res?;
+                    }
+
+                    self.data_buf_first_unused = 0usize;
+                }
+
+                let bytes = Bytes::from(Box::new(self.data_buf[self.data_buf_first_unused..(self.data_buf_first_unused + version_info.length as usize)]));
+                self.data_buf_first_unused += version_info.length as usize;
+                self.current_data_file_offset += version_info.length as u64;
 
                 self.versionarray_index = Some(index + 1);
+
                 return Some((
                     Lsn(u64::from_ne_bytes(version_info.lsn)),
                     PageVersion::Wal(WALRecord {
                         will_init: false,
-                        rec: Bytes::from(record_data),
+                        rec: bytes,
                         main_data_offset: version_info.main_data_offset,
                     }),
                 ));
@@ -347,10 +355,10 @@ impl<'a> Iterator for LineageBranchVersionIterator<'a> {
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         match self.versionarray_index {
-            None => (self.n_total_versions + 1, Some(self.n_total_versions + 1)),
-            Some(index) => (
-                self.n_total_versions - index,
-                Some(self.n_total_versions - index),
+            None => (1, None),
+            Some(_) => (
+                self.n_total_versions + 1,
+                Some(self.n_total_versions + 1),
             ),
         }
     }

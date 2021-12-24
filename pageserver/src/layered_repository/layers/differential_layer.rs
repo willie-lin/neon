@@ -48,17 +48,18 @@ use crate::layered_repository::storage_layer::{
 use crate::PageServerConf;
 use crate::{ZTenantId, ZTimelineId};
 use anyhow::{ensure, Result};
-use parking_lot::RwLock;
+use parking_lot::{MappedRwLockReadGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use serde::{Deserialize, Serialize};
 use static_assertions;
 use std::fs;
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{BufReader, BufWriter, Write};
 use std::mem::size_of;
 use std::ops::Bound::Included;
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::Arc;
+use futures::FutureExt;
 use zenith_utils::vec_map::VecMap;
 
 use zenith_utils::lsn::Lsn;
@@ -66,13 +67,8 @@ use zenith_utils::multi_bitmap::LayeredBitmap;
 
 use crate::layered_repository::filebufutils::{get_buf, BufPage};
 use crate::layered_repository::inmemory_layer::InMemoryLayer;
-use crate::layered_repository::layers::differential_layer::file_format::{
-    InfoPageV1, LineageInfo, UnalignFileOffset,
-};
-use crate::layered_repository::layers::differential_layer::serdes::{
-    read_lineage, write_latest_metadata, write_old_page_versions_section,
-    write_page_lineages_section, write_page_versions_map,
-};
+use crate::layered_repository::layers::differential_layer::file_format::{InfoPageV1, InfoPageVersions, LineageInfo, UnalignFileOffset};
+use crate::layered_repository::layers::differential_layer::serdes::{read_lineage, read_page_versions_map, write_latest_metadata, write_old_page_versions_section, write_page_lineages_section, write_page_versions_map};
 use crate::layered_repository::layers::meta::differential_meta::{
     AsLatestLsn, DifferentialMetadata,
 };
@@ -447,6 +443,49 @@ impl Layer for DifferentialLayer {
 }
 
 impl DifferentialLayer {
+    pub fn inner(&self) -> MappedRwLockReadGuard<Arc<DifferentialLayerInner>> {
+        let mut read_locked = self.inner.read();
+        if read_locked.is_none() {
+            drop(read_locked);
+            let write_locked = self.inner.write();
+
+            *write_locked = Some(self.load_inner());
+
+            read_locked = RwLockWriteGuard::downgrade(write_locked);
+        }
+
+        RwLockReadGuard::map(
+            read_locked,
+            |opt| opt.as_ref().expect("Failed to find info for"),
+        )
+    }
+
+    pub fn load_inner(&self) -> Result<Arc<DifferentialLayerInner>> {
+        let file = File::open(self.path())?;
+        let mut reader = BufReader::new(file);
+
+        let metapage: InfoPageVersions = InfoPageVersions::V1(InfoPageV1::default());
+
+        let metapage = match metapage { InfoPageVersions::V1(it) => it };
+
+
+        let mut pages_contained = LayeredBitmap::new(RELISH_SEG_SIZE as usize);
+
+        read_page_versions_map(&mut reader, metapage.new_page_versions_map_start, &mut pages_contained)?;
+
+        let mut inner = DifferentialLayerInner {
+            metadata: DifferentialMetadata::new_with_maps(
+
+            ),
+            last_snapshot: Default::default(),
+            metapage,
+            file: Arc::new(file),
+            relsizes: Default::default()
+        };
+        inner.load()?;
+        Ok(Arc::new(inner))
+    }
+
     pub fn new(
         conf: &'static PageServerConf,
         timelineid: ZTimelineId,
@@ -512,51 +551,48 @@ impl DifferentialLayer {
             &filename,
         );
 
-        let mut file = OpenOptions::new()
+        let mut bufwriter = BufWriter::new(OpenOptions::new()
             .create(true)
             .write(true)
             .read(true)
-            .open(&buf)?;
-        let mut next_free_block = 0;
+            .open(&buf)?);
+        let mut offset = 0usize;
 
-        write_latest_metadata(&mut file, next_free_block, &meta, &my_buffer)?;
-        next_free_block += 1;
+        offset = write_latest_metadata(&mut bufwriter, offset, &meta)?;
 
-        meta.old_page_versions_map_start = next_free_block;
+        meta.old_page_versions_map_start = offset;
 
-        next_free_block =
-            write_old_page_versions_section(&mut file, next_free_block, inmem_inner.deref());
+        offset = write_old_page_versions_section(
+            &mut bufwriter,
+            offset,
+            inmem_inner.deref().changed_since_snapshot()
+        )?;
 
-        meta.page_lineages_start = next_free_block;
+        meta.page_lineages_start = offset;
 
         let mut lineage_block_offsets =
             LayeredBitmap::<LineagePointer>::new(RELISH_SEG_SIZE as usize);
 
-        next_free_block = write_page_lineages_section(
-            &mut file,
-            next_free_block,
+        offset = write_page_lineages_section(
+            &mut bufwriter,
+            offset,
             inmem_inner.deref(),
             &mut lineage_block_offsets,
-        );
+        )?;
 
-        meta.new_page_versions_map_start = next_free_block;
+        meta.new_page_versions_map_start = offset;
 
-        next_free_block =
-            write_page_versions_map(&mut file, next_free_block, &lineage_block_offsets);
+        offset = write_page_versions_map(
+            &mut bufwriter,
+            offset,
+            &lineage_block_offsets,
+        )?;
 
-        meta.page_images_start = next_free_block;
+        meta.page_images_start = offset;
+
+        let file = bufwriter.into_inner()?;
 
         let arc_file = Arc::new(file);
-        {
-            // Note: This clone is safe, because we don't read / write using seek operations;
-            // only through known offsets.
-            let mut my_inner_metadata =
-                DifferentialMetadata::<LineagePointer>::new(arc_file.clone());
-
-            for it in lineage_block_offsets.iter() {
-                my_inner_metadata.add_mutated_page(it.0 as u32, *it.1);
-            }
-        }
 
         Ok(Box::new(DifferentialLayer {
             path_or_conf: PathOrConf::Conf(conf),

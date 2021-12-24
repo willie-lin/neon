@@ -1,7 +1,8 @@
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use postgres_ffi::pg_constants::BLCKSZ;
 use std::fs::File;
-use std::mem::{align_of, size_of};
+use std::io::{BufWriter, IoSlice, IoSliceMut, Write};
+use std::mem::{align_of, MaybeUninit, size_of};
 use std::ops::Deref;
 use std::os::unix::fs::FileExt;
 
@@ -74,9 +75,9 @@ pub fn write_item_to_blocky_file<'a, T>(
     cur_blockno: u32,
     cur_offset: u16,
     data: &T,
-    buf: &mut RwLockWriteGuard<'a, BufPage>,
+    mut buf: RwLockWriteGuard<'a, BufPage>,
     my_buf: &'a RwLock<BufPage>,
-) -> ((u32, u16), (u32, u16))
+) -> ((u32, u16), (u32, u16), RwLockWriteGuard<'a, BufPage>)
 where
     T: Copy,
 {
@@ -89,9 +90,8 @@ where
         write_buf(file, my_blockno, buf.deref());
         my_blockno += 1;
         my_offset = 0;
-        let tmp_lock = RwLock::new(BufPage::default());
-        *buf = unsafe { std::mem::transmute(tmp_lock.write()) };
-        *buf = get_buf_mut(file, my_blockno, &my_buf);
+        drop(buf);
+        buf = get_buf_mut(file, my_blockno, &my_buf);
     }
 
     if (my_offset as usize) % align_of::<T>() != 0 {
@@ -111,17 +111,155 @@ where
     data_ptr[0] = *data;
     my_offset += size_of::<T>() as u16;
 
-    return (start, (my_blockno, my_offset));
+    return (start, (my_blockno, my_offset), buf);
 }
+
+// macro_rules! read_buf (
+//     ( $buf:ident, $typ:ty ) => {
+//         {
+//             let (it, tail_data) = $buf.split_at(size_of::<$typ>());
+//             let (head, data_ptr, tail) = unsafe { it.align_to_mut::<$typ>() };
+//
+//             debug_assert_eq!(head.len(), 0);
+//             debug_assert_eq!(tail.len(), 0);
+//             debug_assert_eq!(data_ptr.len(), 1);
+//             $buf = tail_data;
+//             &data_ptr[0]
+//         }
+//     }
+//     ( $buf:ident, $typ:ty, $n:literal ) => {
+//         {
+//             debug_assert!($buf.len() >= size_of::<$typ>() * $n);
+//
+//             let (it, tail_data) = $buf.split_at(size_of::<$typ>() * $n:literal);
+//             let (head, data_ptr, tail) = unsafe { it.align_to_mut::<$typ>() };
+//
+//             debug_assert_eq!(head.len(), 0);
+//             debug_assert_eq!(tail.len(), 0);
+//             debug_assert_eq!(data_ptr.len(), $n);
+//             $buf = tail_data;
+//             data_ptr
+//         }
+//     }
+// );
+
+#[macro_export]
+macro_rules! val_to_write (
+    ( $val:ident ) => {
+        let tmp = core::slice::from_ref(& $val );
+        let (_, bytes, _) = unsafe { tmp.align_to::<u8>() };
+        IoSlice::new(bytes)
+    };
+    ( $drop:pat ; $val:ident) => {
+        let tmp = & $val [..];
+        let (_, bytes, _) = unsafe { tmp.align_to::<u8>() };
+        IoSlice::new(bytes)
+    };
+);
+
+#[macro_export]
+macro_rules! val_to_read (
+    ( $val:ident ) => {
+        let tmp = core::slice::from_mut(& $val );
+        let (_, bytes, _) = unsafe { tmp.align_to::<u8>() };
+        IoSliceMut::new(bytes)
+    };
+    ( $drop:pat ; $val:ident) => {
+        let tmp = &mut $val [..];
+        let (_, bytes, _) = unsafe { tmp.align_to_mut::<u8>() };
+        IoSliceMut::new(bytes)
+    };
+);
+
+#[macro_export]
+macro_rules! write_to_file (
+    ( $writer:ident, $offset:ident, $( $val:ident $( $p:pat )? ),+ ) => {
+        {
+            let mut bufs = vec![ ( $(
+                {
+                    val_to_write!( $( $p ; )? $val )
+                }
+            ),+ )];
+
+            let mut bufs_ref: &mut [IoSlice] = &mut bufs[..];
+
+            $writer.seek(SeekFrom::Start($offset))?;
+
+            loop {
+                let mut len_written = std::io::Write::write_vectored($writer, bufs_ref)?;
+                $offset += len_written as u64;
+
+                while len_written != 0 {
+                    if bufs_ref[0].len() < len_written {
+                        len_written -= bufs_ref[0].len();
+                        bufs_ref = &mut bufs_ref[1..];
+                    } else {
+                        bufs_ref[0] = IoSlice::new(bufs_ref[0].split_at(len_written).1);
+                        break;
+                    }
+                }
+
+                if bufs_ref.len() == 0 {
+                    break;
+                }
+            }
+
+            Ok($offset)
+        }
+    }
+);
+
+#[macro_export]
+macro_rules! read_from_file (
+    ( $writer:ident, $offset:ident, $( $val:ident $( $p:pat )? ),+ ) => {
+        {
+            let mut bufs = vec![ $(
+                {
+                    val_to_read!( $( $p ; )? $val )
+                }
+            ),+ ];
+            let mut bufs_ref: &mut [IoSliceMut] = &mut bufs[..];
+
+            $writer.seek(SeekFrom::Start($offset))?;
+
+            loop {
+                let mut len_read = std::io::Read::read_vectored($writer, bufs_ref)?;
+                $offset += len_read as u64;
+
+                while len_read != 0 {
+                    if bufs_ref[0].len() <= len_read {
+                        len_read -= bufs_ref[0].len();
+                        bufs_ref = &mut bufs_ref[1..];
+                    } else {
+                        // We now have fully processed the read components.
+                        bufs_ref[0] = IoSliceMut::new(bufs_ref[0].split_at_mut(len_read).1);
+                        break;
+                    }
+                }
+
+                while bufs_ref.len() >= 0 && bufs_ref[0].len() == 0 {
+                    bufs_ref = &mut bufs_ref[1..];
+                }
+
+                if bufs_ref.len() == 0 {
+                    break;
+                }
+            }
+
+            Ok($offset)
+        }
+    }
+);
+
 
 pub fn read_item_from_blocky_file<'a, T>(
     file: &File,
     cur_blockno: u32,
     cur_offset: u16,
     data: &mut T,
-    buf: &mut RwLockReadGuard<'a, BufPage>,
+    mut buf: RwLockReadGuard<'a, BufPage>,
     my_buf: &'a RwLock<BufPage>,
-) -> (u32, u16)
+) -> ((u32, u16), RwLockReadGuard<'a, BufPage>)
 where
     T: Copy,
 {
@@ -133,7 +271,8 @@ where
     if ((BLCKSZ - my_offset) as usize) < size_of::<T>() {
         my_blockno += 1;
         my_offset = 0;
-        *buf = get_buf(file, my_blockno, &my_buf);
+        drop(buf);
+        buf = get_buf(file, my_blockno, &my_buf);
     }
 
     if (my_offset as usize) % align_of::<T>() != 0 {
@@ -150,7 +289,7 @@ where
     *data = data_ptr[0];
     my_offset += size_of::<T>() as u16;
 
-    return (my_blockno, my_offset);
+    return ((my_blockno, my_offset), buf);
 }
 
 #[must_use]
@@ -159,9 +298,9 @@ pub fn write_slice_to_blocky_file<'a, T>(
     cur_blockno: u32,
     cur_offset: u16,
     data: &[T],
-    buf: &mut RwLockWriteGuard<'a, BufPage>,
+    mut buf: RwLockWriteGuard<'a, BufPage>,
     my_buf: &'a RwLock<BufPage>,
-) -> (u32, u16)
+) -> ((u32, u16), RwLockWriteGuard<'a, BufPage>)
 where
     T: Copy,
 {
@@ -180,9 +319,8 @@ where
             write_buf(file, my_blockno, buf.deref());
             my_blockno += 1;
             my_offset = 0;
-            let tmp_lock = RwLock::new(BufPage::default());
-            *buf = unsafe { std::mem::transmute(tmp_lock.write()) };
-            *buf = get_buf_mut(file, my_blockno, my_buf);
+            drop(buf);
+            buf = get_buf_mut(file, my_blockno, my_buf);
         }
 
         let (_, overwritable_data) = buf.data_mut().split_at_mut(my_offset as usize);
@@ -201,7 +339,7 @@ where
         my_offset += (added * size_of::<T>()) as u16;
     }
 
-    return (my_blockno, my_offset);
+    return ((my_blockno, my_offset), buf);
 }
 
 #[must_use]
@@ -210,9 +348,9 @@ pub fn read_slice_from_blocky_file<'a, T>(
     cur_blockno: u32,
     cur_offset: u16,
     buffer: &mut [T],
-    buf: &mut RwLockReadGuard<'a, BufPage>,
+    mut buf: RwLockReadGuard<'a, BufPage>,
     my_buf: &'a RwLock<BufPage>,
-) -> (u32, u16)
+) -> ((u32, u16), RwLockReadGuard<'a, BufPage>)
 where
     T: Copy,
 {
@@ -231,7 +369,8 @@ where
         if ((BLCKSZ - my_offset) as usize) < size_of::<T>() {
             my_blockno += 1;
             my_offset = 0;
-            *buf = get_buf(file, my_blockno, my_buf);
+            drop(buf);
+            buf = get_buf(file, my_blockno, my_buf);
         }
 
         let (_, readable_data) = buf.data().split_at(my_offset as usize);
@@ -251,5 +390,5 @@ where
         my_offset += (added * size_of::<T>()) as u16;
     }
 
-    return (my_blockno, my_offset);
+    return ((my_blockno, my_offset), buf);
 }

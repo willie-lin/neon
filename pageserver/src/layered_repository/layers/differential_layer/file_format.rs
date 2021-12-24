@@ -7,43 +7,54 @@ use zenith_utils::lsn::Lsn;
 #[repr(C, align(2))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct UnalignFileOffset {
-    blk_hi: u16,
-    blk_lo: u16,
-    offset: u16,
+    hi: u16,
+    mid: u16,
+    low: u16,
 }
 
 impl UnalignFileOffset {
     pub fn new(blockno: u32, offset: u16) -> Self {
         Self {
-            blk_hi: (blockno >> 16) as u16,
-            blk_lo: (blockno & 0xFFFF) as u16,
-            offset,
+            hi: (blockno >> 16) as u16,
+            mid: (blockno & 0xFFFF) as u16,
+            low: offset,
+        }
+    }
+    pub fn from(offset: usize) -> Self {
+        Self {
+            hi: ((offset >> 32) & 0xFFFF) as u16,
+            mid: ((offset >> 16) & 0xFFFF) as u16,
+            low: (offset & 0xFFFF) as u16,
         }
     }
 
     pub fn blockno(&self) -> u32 {
-        (self.blk_hi as u32) << 16 | (self.blk_lo as u32)
+        (self.hi as u32) << 16 | (self.mid as u32)
     }
 
     pub fn offset(&self) -> u16 {
-        self.offset
+        self.low
+    }
+
+    pub fn full_offset(&self) -> usize {
+        (self.hi as usize) << 32 | (self.mid as usize) << 16 | (self.low as usize)
     }
 }
 
 #[repr(C)]
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
 pub struct InfoPageV1 {
-    pub old_page_versions_map_start: u32,
-    pub new_page_versions_map_start: u32,
-    pub page_lineages_start: u32,
-    pub page_images_start: u32,
-    pub seg_lengths_start: u32,
+    pub old_page_versions_map_start: usize,
+    pub new_page_versions_map_start: usize,
+    pub page_lineages_start: usize,
+    pub page_images_start: usize,
+    pub seg_lengths_start: usize,
 }
 
 // Used for size assertion checks.
 #[repr(C)]
-union InfoPageVersions {
-    v1: InfoPageV1,
+pub enum InfoPageVersions {
+    V1(InfoPageV1),
 }
 
 const_assert!(size_of::<InfoPageVersions>() + size_of::<u32>() <= LAYER_PAGE_SIZE,);
@@ -67,6 +78,19 @@ pub struct LineageBranchInfo {
     pub branch_ptr_data: BranchPtrData,
 }
 
+impl Default for LineageBranchInfo {
+    fn default() -> Self {
+        Self {
+            start_lsn: Lsn::default(),
+            branch_ptr_data: BranchPtrData {
+                item_ptr: Default::default(),
+                tail_padding: 0,
+                typ: BranchPtrType::PageImage,
+            },
+        }
+    }
+}
+
 ///
 /// Version branch header
 ///
@@ -76,13 +100,13 @@ pub struct LineageBranchInfo {
 /// head_item_len and head_item_data_off are used to reconstruct the first record of the branch, the
 /// type of which is detailed in the BranchInfo struct above.
 #[repr(C, align(4))]
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
 pub struct WalInitiatedLineageBranchHeader {
     pub num_entries: NonZeroU32,
     pub head: WalOnlyLineageBranchHeader,
 }
 #[repr(C, align(4))]
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
 pub struct WalOnlyLineageBranchHeader {
     pub length: NonZeroU32,
     pub main_data_offset: NonZeroU32,
@@ -96,13 +120,13 @@ pub struct WalOnlyLineageBranchHeader {
 /// head_item_len and head_item_data_off are used to reconstruct the first record of the branch, the
 /// type of which is detailed in the BranchInfo struct above.
 #[repr(C, align(4))]
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
 pub struct PageInitiatedLineageBranchHeader {
     pub num_entries: NonZeroU32,
     pub head: PageOnlyLineageBranchHeader,
 }
 #[repr(C, align(4))]
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
 pub struct PageOnlyLineageBranchHeader {
     pub length: NonZeroU32,
 }
@@ -155,7 +179,7 @@ pub struct BranchPtrData {
 const_assert_eq!(std::mem::size_of::<BranchPtrData>(), 8usize);
 
 #[repr(C, align(8))]
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
 pub struct LineageInfo {
     pub latest_lsn: Lsn,
     pub num_branches: u32,

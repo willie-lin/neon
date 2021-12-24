@@ -44,6 +44,9 @@ use std::{
         RwLock, RwLockReadGuard, RwLockWriteGuard,
     },
 };
+use std::fs::File;
+use std::os::unix::fs::FileExt;
+use std::sync::{Arc, TryLockResult};
 
 use once_cell::sync::OnceCell;
 use tracing::error;
@@ -54,9 +57,22 @@ use zenith_utils::{
 
 use crate::layered_repository::writeback_ephemeral_file;
 use crate::{relish::RelTag, PageServerConf};
+use crate::layered_repository::storage_layer::SegmentTag;
 
 static PAGE_CACHE: OnceCell<PageCache> = OnceCell::new();
 const TEST_PAGE_CACHE_SIZE: usize = 10;
+
+#[repr(C, align(PAGE_SZ))]
+#[derive(Debug)]
+pub struct BufPage { data: [u8; PAGE_SZ] }
+
+impl Default for BufPage {
+    fn default() -> Self {
+        Self {
+            data: [0u8; PAGE_SZ],
+        }
+    }
+}
 
 ///
 /// Initialize the page cache. This must be called once at page server startup.
@@ -102,6 +118,11 @@ enum CacheKey {
         file_id: u64,
         blkno: u32,
     },
+    LayerPage {
+        layer_key: LayerKey,
+        blockno: u32,
+        file_ref: Arc<File>,
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
@@ -110,6 +131,15 @@ struct MaterializedPageHashKey {
     timeline_id: ZTimelineId,
     rel_tag: RelTag,
     blknum: u32,
+}
+
+#[derive(Debug, PartialEq, Eq, Hash, Copy, Clone)]
+struct LayerKey {
+    tenant_id: ZTenantId,
+    timeline_id: ZTimelineId,
+    seg_tag: SegmentTag,
+    min_lsn: Lsn,
+    max_lsn: Lsn,
 }
 
 #[derive(Clone)]
@@ -176,6 +206,8 @@ pub struct PageCache {
     materialized_page_map: RwLock<HashMap<MaterializedPageHashKey, Vec<Version>>>,
 
     ephemeral_page_map: RwLock<HashMap<(u64, u32), usize>>,
+
+    layer_page_map: RwLock<HashMap<(LayerKey, u32), usize>>,
 
     /// The actual buffers with their metadata.
     slots: Box<[Slot]>,
@@ -586,6 +618,10 @@ impl PageCache {
                 let map = self.ephemeral_page_map.read().unwrap();
                 Some(*map.get(&(*file_id, *blkno))?)
             }
+            CacheKey::LayerPage { layer_key, blockno, .. } => {
+                let map = self.layer_page_map.read().unwrap();
+                Some(*map.get(&(*layer_key, *blockno))?)
+            }
         }
     }
 
@@ -608,6 +644,10 @@ impl PageCache {
             CacheKey::EphemeralPage { file_id, blkno } => {
                 let map = self.ephemeral_page_map.read().unwrap();
                 Some(*map.get(&(*file_id, *blkno))?)
+            }
+            CacheKey::LayerPage { layer_key, blockno, .. } => {
+                let map = self.layer_page_map.read().unwrap();
+                Some(*map.get(&(*layer_key, *blockno))?)
             }
         }
     }
@@ -638,6 +678,11 @@ impl PageCache {
             CacheKey::EphemeralPage { file_id, blkno } => {
                 let mut map = self.ephemeral_page_map.write().unwrap();
                 map.remove(&(*file_id, *blkno))
+                    .expect("could not find old key in mapping");
+            }
+            CacheKey::LayerPage { layer_key, blockno, .. } => {
+                let mut map = self.layer_page_map.write().unwrap();
+                map.remove(&(*layer_key, *blockno))
                     .expect("could not find old key in mapping");
             }
         }
@@ -673,6 +718,16 @@ impl PageCache {
             CacheKey::EphemeralPage { file_id, blkno } => {
                 let mut map = self.ephemeral_page_map.write().unwrap();
                 match map.entry((*file_id, *blkno)) {
+                    Entry::Occupied(entry) => Some(*entry.get()),
+                    Entry::Vacant(entry) => {
+                        entry.insert(slot_idx);
+                        None
+                    }
+                }
+            }
+            CacheKey::LayerPage { layer_key, blockno, .. } => {
+                let mut map = self.layer_page_map.write().unwrap();
+                match map.entry((*layer_key, *blockno)) {
                     Entry::Occupied(entry) => Some(*entry.get()),
                     Entry::Vacant(entry) => {
                         entry.insert(slot_idx);
@@ -741,6 +796,16 @@ impl PageCache {
             CacheKey::EphemeralPage { file_id, blkno } => {
                 writeback_ephemeral_file(*file_id, *blkno, buf)
             }
+            CacheKey::LayerPage { blockno, file_ref, .. } => {
+                // This binds us to only use the unix file system, but that doesn't (currently)
+                // matter as write_ephemeral_file is also limited to that file system, and we
+                // don't run our cloud on windows systems.
+                File::write_all_at(
+                    file_ref,
+                    buf,
+                    (*blockno as u64) * (PAGE_SZ as u64)
+                )
+            }
         }
     }
 
@@ -750,12 +815,12 @@ impl PageCache {
     fn new(num_pages: usize) -> Self {
         assert!(num_pages > 0, "page cache size must be > 0");
 
-        let page_buffer = Box::leak(vec![0u8; num_pages * PAGE_SZ].into_boxed_slice());
+        let page_buffer = Box::leak(vec![BufPage::default(); num_pages].into_boxed_slice());
 
         let slots = page_buffer
-            .chunks_exact_mut(PAGE_SZ)
+            .iter_mut()
             .map(|chunk| {
-                let buf: &mut [u8; PAGE_SZ] = chunk.try_into().unwrap();
+                let buf: &mut [u8; PAGE_SZ] = chunk.data.try_into().unwrap();
 
                 Slot {
                     inner: RwLock::new(SlotInner {
@@ -771,6 +836,7 @@ impl PageCache {
         Self {
             materialized_page_map: Default::default(),
             ephemeral_page_map: Default::default(),
+            layer_page_map: Default::default(),
             slots,
             next_evict_slot: AtomicUsize::new(0),
         }
