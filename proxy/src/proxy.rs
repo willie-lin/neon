@@ -120,7 +120,7 @@ pub fn proxy_conn_main(state: &'static ProxyState, socket: TcpStream) -> anyhow:
         None => return Ok(()),
     };
 
-    let server = zenith_utils::sock_split::BidiStream::from_tcp(server);
+    let server = zenith_utils::sock_split::BidiStream::from_raw(server);
 
     let client = match client {
         Stream::Bidirectional(bidi_stream) => bidi_stream,
@@ -348,10 +348,10 @@ async fn connect_to_db(
 
 /// Concurrently proxy both directions of the client and server connections
 fn proxy(
-    (client_read, client_write): (ReadStream, WriteStream),
-    (server_read, server_write): (ReadStream, WriteStream),
+    (client_read, client_write): (ReadStream<TcpStream>, WriteStream<TcpStream>),
+    (server_read, server_write): (ReadStream<TcpStream>, WriteStream<TcpStream>),
 ) -> anyhow::Result<()> {
-    fn do_proxy(mut reader: impl io::Read, mut writer: WriteStream) -> io::Result<u64> {
+    fn do_proxy(mut reader: impl io::Read, mut writer: WriteStream<TcpStream>) -> io::Result<u64> {
         /// FlushWriter will make sure that every message is sent as soon as possible
         struct FlushWriter<W>(W);
 

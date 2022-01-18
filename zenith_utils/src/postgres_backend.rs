@@ -97,8 +97,8 @@ pub enum ProcessMsgResult {
 /// Always-writeable sock_split stream.
 /// May not be readable. See [`PostgresBackend::take_stream_in`]
 pub enum Stream {
-    Bidirectional(BidiStream),
-    WriteOnly(WriteStream),
+    Bidirectional(BidiStream<TcpStream>),
+    WriteOnly(WriteStream<TcpStream>),
 }
 
 impl Stream {
@@ -182,13 +182,11 @@ impl PostgresBackend {
     ) -> io::Result<Self> {
         let peer_addr = socket.peer_addr()?;
         if set_read_timeout {
-            socket
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(5)))?;
         }
 
         Ok(Self {
-            stream: Some(Stream::Bidirectional(BidiStream::from_tcp(socket))),
+            stream: Some(Stream::Bidirectional(BidiStream::from_raw(socket))),
             buf_out: BytesMut::with_capacity(10 * 1024),
             state: ProtoState::Initialization,
             md5_salt: [0u8; 4],
@@ -198,23 +196,24 @@ impl PostgresBackend {
         })
     }
 
+
+    pub fn get_peer_addr(&self) -> &SocketAddr {
+        &self.peer_addr
+    }
+
     pub fn into_stream(self) -> Stream {
         self.stream.unwrap()
     }
 
     /// Get direct reference (into the Option) to the read stream.
-    fn get_stream_in(&mut self) -> Result<&mut BidiStream> {
+    fn get_stream_in(&mut self) -> Result<&mut impl io::Read> {
         match &mut self.stream {
             Some(Stream::Bidirectional(stream)) => Ok(stream),
             _ => Err(anyhow!("reader taken")),
         }
     }
 
-    pub fn get_peer_addr(&self) -> &SocketAddr {
-        &self.peer_addr
-    }
-
-    pub fn take_stream_in(&mut self) -> Option<ReadStream> {
+    pub fn take_stream_in(&mut self) -> Option<ReadStream<TcpStream>> {
         let stream = self.stream.take();
         match stream {
             Some(Stream::Bidirectional(bidi_stream)) => {
@@ -364,12 +363,12 @@ impl PostgresBackend {
                         // to bypass auth for new users.
                         handler.startup(self, &m)?;
 
-                        match self.auth_type {
+                        self.state = match self.auth_type {
                             AuthType::Trust => {
                                 self.write_message_noflush(&BeMessage::AuthenticationOk)?
                                     .write_message_noflush(&BeParameterStatusMessage::encoding())?
                                     .write_message(&BeMessage::ReadyForQuery)?;
-                                self.state = ProtoState::Established;
+                                ProtoState::Established
                             }
                             AuthType::MD5 => {
                                 rand::thread_rng().fill(&mut self.md5_salt);
@@ -377,13 +376,13 @@ impl PostgresBackend {
                                 self.write_message(&BeMessage::AuthenticationMD5Password(
                                     &md5_salt,
                                 ))?;
-                                self.state = ProtoState::Authentication;
+                                ProtoState::Authentication
                             }
                             AuthType::ZenithJWT => {
                                 self.write_message(&BeMessage::AuthenticationCleartextPassword)?;
-                                self.state = ProtoState::Authentication;
+                                ProtoState::Authentication
                             }
-                        }
+                        };
                     }
                     FeStartupPacket::CancelRequest { .. } => {
                         return Ok(ProcessMsgResult::Break);

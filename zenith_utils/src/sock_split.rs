@@ -1,169 +1,233 @@
 use std::{
-    io::{self, BufReader, Write},
+    io::{self, BufReader},
     net::{Shutdown, TcpStream},
     sync::Arc,
 };
 
 use rustls::Session;
 
-/// Wrapper supporting reads of a shared TcpStream.
-pub struct ArcTcpRead(Arc<TcpStream>);
+/// Wrapper supporting reads of a shared stream.
+#[repr(transparent)]
+pub struct ArcStream<S>(Arc<S>);
 
-impl io::Read for ArcTcpRead {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+impl<S> ArcStream<S> {
+    pub fn new(stream: S) -> Self {
+        Self(Arc::new(stream))
+    }
+}
+
+impl<S> io::Read for ArcStream<S>
+where
+    for<'a> &'a <Arc<S> as std::ops::Deref>::Target: io::Read,
+{
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         (&*self.0).read(buf)
     }
 }
 
-impl std::ops::Deref for ArcTcpRead {
-    type Target = TcpStream;
+impl<S> io::Write for ArcStream<S>
+where
+    for<'a> &'a <Arc<S> as std::ops::Deref>::Target: io::Write,
+{
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        (&*self.0).write(buf)
+    }
 
-    fn deref(&self) -> &Self::Target {
-        self.0.deref()
+    fn flush(&mut self) -> io::Result<()> {
+        (&*self.0).flush()
     }
 }
 
-/// Wrapper around a TCP Stream supporting buffered reads.
-pub struct BufStream(BufReader<ArcTcpRead>);
+impl<S> std::ops::Deref for ArcStream<S> {
+    type Target = S;
 
-impl io::Read for BufStream {
+    fn deref(&self) -> &Self::Target {
+        &*self.0
+    }
+}
+
+impl<S> Clone for ArcStream<S> {
+    fn clone(&self) -> Self {
+        ArcStream(Arc::clone(&self.0))
+    }
+}
+
+/// Wrapper which supports both writes and buffered reads.
+/// This should've been just an [`io::Write`] impl for [`BufReader`].
+/// TODO: maybe it should implement everything [`BufReader`] implements,
+/// e.g. [`std::io::BufRead`] and [`std::io::Seek`].
+#[repr(transparent)]
+pub struct BufStream<S>(BufReader<S>);
+
+impl<S: io::Read> BufStream<S> {
+    pub fn new(stream: S) -> Self {
+        Self(BufReader::new(stream))
+    }
+}
+
+impl<S> BufStream<S> {
+    /// Unwrap into the internal [`BufReader`].
+    fn into_reader(self) -> BufReader<S> {
+        self.0
+    }
+
+    /// Returns an shared reference to the underlying stream.
+    fn get_ref(&self) -> &S {
+        self.0.get_ref()
+    }
+
+    /// Returns an exclusive reference to the underlying stream.
+    fn get_mut(&mut self) -> &mut S {
+        self.0.get_mut()
+    }
+}
+impl<S: io::Read> io::Read for BufStream<S> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.0.read(buf)
     }
 }
 
-impl io::Write for BufStream {
+impl<S: io::Write> io::Write for BufStream<S> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.get_ref().write(buf)
+        self.get_mut().write(buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.get_ref().flush()
+        self.get_mut().flush()
     }
 }
 
-impl BufStream {
-    /// Unwrap into the internal BufReader.
-    fn into_reader(self) -> BufReader<ArcTcpRead> {
-        self.0
-    }
-
-    /// Returns a reference to the underlying TcpStream.
-    fn get_ref(&self) -> &TcpStream {
-        &*self.0.get_ref().0
-    }
-}
-
-pub enum ReadStream {
-    Tcp(BufReader<ArcTcpRead>),
-    Tls(rustls_split::ReadHalf<rustls::ServerSession>),
-}
-
-impl io::Read for ReadStream {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match self {
-            Self::Tcp(reader) => reader.read(buf),
-            Self::Tls(read_half) => read_half.read(buf),
-        }
-    }
-}
-
-impl ReadStream {
-    pub fn shutdown(&mut self, how: Shutdown) -> io::Result<()> {
-        match self {
-            Self::Tcp(stream) => stream.get_ref().shutdown(how),
-            Self::Tls(write_half) => write_half.shutdown(how),
-        }
-    }
-}
-
-pub enum WriteStream {
-    Tcp(Arc<TcpStream>),
-    Tls(rustls_split::WriteHalf<rustls::ServerSession>),
-}
-
-impl WriteStream {
-    pub fn shutdown(&mut self, how: Shutdown) -> io::Result<()> {
-        match self {
-            Self::Tcp(stream) => stream.shutdown(how),
-            Self::Tls(write_half) => write_half.shutdown(how),
-        }
-    }
-}
-
-impl io::Write for WriteStream {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match self {
-            Self::Tcp(stream) => stream.as_ref().write(buf),
-            Self::Tls(write_half) => write_half.write(buf),
-        }
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        match self {
-            Self::Tcp(stream) => stream.as_ref().flush(),
-            Self::Tls(write_half) => write_half.flush(),
-        }
-    }
-}
+type BufArcStream<T> = BufStream<ArcStream<T>>;
 
 type TlsStream<T> = rustls::StreamOwned<rustls::ServerSession, T>;
 
-pub enum BidiStream {
-    Tcp(BufStream),
-    /// This variant is boxed, because [`rustls::ServerSession`] is quite larger than [`BufStream`].
-    Tls(Box<TlsStream<BufStream>>),
+pub trait CanRead {}
+pub trait CanWrite {}
+
+pub trait StreamFamily<S> {
+    type Raw;
+    type Tls;
 }
 
-impl BidiStream {
-    pub fn from_tcp(stream: TcpStream) -> Self {
-        Self::Tcp(BufStream(BufReader::new(ArcTcpRead(Arc::new(stream)))))
-    }
+pub enum Stream<F: StreamFamily<S>, S> {
+    Raw(F::Raw),
+    Tls(F::Tls),
+}
 
+pub enum SRead {}
+
+impl CanRead for SRead {}
+
+impl<S> StreamFamily<S> for SRead {
+    type Raw = BufArcStream<S>;
+    type Tls = rustls_split::ReadHalf<rustls::ServerSession>;
+}
+
+pub enum SWrite {}
+
+impl CanWrite for SWrite {}
+
+impl<S> StreamFamily<S> for SWrite {
+    type Raw = ArcStream<S>;
+    type Tls = rustls_split::WriteHalf<rustls::ServerSession>;
+}
+
+pub enum SBidi {}
+
+impl CanRead for SBidi {}
+impl CanWrite for SBidi {}
+
+impl<S> StreamFamily<S> for SBidi
+where
+    S: io::Read + io::Write,
+    for<'a> &'a S: io::Read + io::Write,
+{
+    type Raw = BufArcStream<S>;
+    type Tls = Box<TlsStream<BufArcStream<S>>>;
+}
+
+pub type ReadStream<S> = Stream<SRead, S>;
+pub type WriteStream<S> = Stream<SWrite, S>;
+pub type BidiStream<S> = Stream<SBidi, S>;
+
+impl ReadStream<TcpStream> {
     pub fn shutdown(&mut self, how: Shutdown) -> io::Result<()> {
         match self {
-            Self::Tcp(stream) => stream.get_ref().shutdown(how),
-            Self::Tls(tls_boxed) => {
+            Self::Raw(stream) => stream.get_ref().shutdown(how),
+            Self::Tls(stream) => stream.shutdown(how),
+        }
+    }
+}
+
+impl WriteStream<TcpStream> {
+    pub fn shutdown(&mut self, how: Shutdown) -> io::Result<()> {
+        match self {
+            Self::Raw(stream) => stream.shutdown(how),
+            Self::Tls(stream) => stream.shutdown(how),
+        }
+    }
+}
+
+impl BidiStream<TcpStream> {
+    pub fn shutdown(&mut self, how: Shutdown) -> io::Result<()> {
+        use std::io::Write;
+
+        match self {
+            Self::Raw(stream) => stream.get_ref().shutdown(how),
+            Self::Tls(stream) => {
                 if how == Shutdown::Read {
-                    tls_boxed.sock.get_ref().shutdown(how)
+                    stream.sock.get_ref().shutdown(how)
                 } else {
-                    tls_boxed.sess.send_close_notify();
-                    let res = tls_boxed.flush();
-                    tls_boxed.sock.get_ref().shutdown(how)?;
+                    stream.sess.send_close_notify();
+                    let res = stream.flush();
+                    stream.sock.get_ref().shutdown(how)?;
                     res
                 }
             }
         }
     }
+}
 
+impl BidiStream<TcpStream> {
     /// Split the bi-directional stream into two owned read and write halves.
-    pub fn split(self) -> (ReadStream, WriteStream) {
+    pub fn split(self) -> (ReadStream<TcpStream>, WriteStream<TcpStream>) {
         match self {
-            Self::Tcp(stream) => {
-                let reader = stream.into_reader();
-                let stream: Arc<TcpStream> = reader.get_ref().0.clone();
-
-                (ReadStream::Tcp(reader), WriteStream::Tcp(stream))
+            Self::Raw(stream) => {
+                let writer = ArcStream::clone(stream.get_ref());
+                (ReadStream::Raw(stream), WriteStream::Raw(writer))
             }
-            Self::Tls(tls_boxed) => {
-                let reader = tls_boxed.sock.into_reader();
+            Self::Tls(stream) => {
+                let reader = stream.sock.into_reader();
                 let buffer_data = reader.buffer().to_owned();
+
                 let read_buf_cfg = rustls_split::BufCfg::with_data(buffer_data, 8192);
                 let write_buf_cfg = rustls_split::BufCfg::with_capacity(8192);
 
-                // TODO would be nice to avoid the Arc here
-                let socket = Arc::try_unwrap(reader.into_inner().0).unwrap();
+                // TODO: make rustls_split work with any Read + Write impl
+                let (read_half, write_half) = rustls_split::split(
+                    Arc::try_unwrap(reader.into_inner().0).unwrap(),
+                    stream.sess,
+                    read_buf_cfg,
+                    write_buf_cfg,
+                );
 
-                let (read_half, write_half) =
-                    rustls_split::split(socket, tls_boxed.sess, read_buf_cfg, write_buf_cfg);
                 (ReadStream::Tls(read_half), WriteStream::Tls(write_half))
             }
         }
     }
+}
+
+impl<S: io::Read + io::Write> BidiStream<S>
+where
+    for<'a> &'a S: io::Read + io::Write,
+{
+    pub fn from_raw(stream: S) -> Self {
+        Self::Raw(BufStream::new(ArcStream::new(stream)))
+    }
 
     pub fn start_tls(self, mut session: rustls::ServerSession) -> io::Result<Self> {
         match self {
-            Self::Tcp(mut stream) => {
+            Self::Raw(mut stream) => {
                 session.complete_io(&mut stream)?;
                 assert!(!session.is_handshaking());
                 Ok(Self::Tls(Box::new(TlsStream::new(session, stream))))
@@ -176,27 +240,66 @@ impl BidiStream {
     }
 }
 
-impl io::Read for BidiStream {
+impl<F, S> io::Read for Stream<F, S>
+where
+    F: StreamFamily<S> + CanRead,
+    F::Raw: io::Read,
+    F::Tls: io::Read,
+{
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
-            Self::Tcp(stream) => stream.read(buf),
-            Self::Tls(tls_boxed) => tls_boxed.read(buf),
+            Self::Raw(stream) => stream.read(buf),
+            Self::Tls(stream) => stream.read(buf),
         }
     }
 }
 
-impl io::Write for BidiStream {
+impl<F, S> io::Write for Stream<F, S>
+where
+    F: StreamFamily<S> + CanWrite,
+    F::Raw: io::Write,
+    F::Tls: io::Write,
+{
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match self {
-            Self::Tcp(stream) => stream.write(buf),
-            Self::Tls(tls_boxed) => tls_boxed.write(buf),
+            Self::Raw(stream) => stream.write(buf),
+            Self::Tls(stream) => stream.write(buf),
         }
     }
 
     fn flush(&mut self) -> io::Result<()> {
         match self {
-            Self::Tcp(stream) => stream.flush(),
-            Self::Tls(tls_boxed) => tls_boxed.flush(),
+            Self::Raw(stream) => stream.flush(),
+            Self::Tls(stream) => stream.flush(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    #[test]
+    fn test_read_write() -> anyhow::Result<()> {
+        let (tx, rx) = std::os::unix::net::UnixStream::pair()?;
+        let mut tx = BidiStream::from_raw(tx);
+        let mut rx = BidiStream::from_raw(rx);
+
+        let mut bytes = [1, 2, 3, 4];
+        tx.write(&bytes)?;
+        rx.read(&mut bytes)?;
+        assert_eq!(bytes, [1, 2, 3, 4]);
+
+        let (tx, rx) = std::os::unix::net::UnixStream::pair()?;
+        let mut tx = WriteStream::Raw(ArcStream::new(tx));
+        let mut rx = ReadStream::Raw(BufStream::new(ArcStream::new(rx)));
+
+        let mut bytes = [1, 2, 3, 4];
+        tx.write(&bytes)?;
+        rx.read(&mut bytes)?;
+        assert_eq!(bytes, [1, 2, 3, 4]);
+
+        Ok(())
     }
 }

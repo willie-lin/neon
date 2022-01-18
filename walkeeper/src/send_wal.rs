@@ -68,7 +68,7 @@ pub struct StandbyReply {
 pub struct ReplicationConn {
     /// This is an `Option` because we will spawn a background thread that will
     /// `take` it from us.
-    stream_in: Option<ReadStream>,
+    stream_in: Option<ReadStream<std::net::TcpStream>>,
 }
 
 /// Scope guard to unregister replication connection from timeline
@@ -119,7 +119,7 @@ impl ReplicationConn {
     /// Handle incoming messages from the network.
     /// This is spawned into the background by `handle_start_replication`.
     fn background_thread(
-        mut stream_in: ReadStream,
+        mut stream_in: ReadStream<std::net::TcpStream>,
         replica_guard: Arc<ReplicationConnGuard>,
     ) -> Result<()> {
         let replica_id = replica_guard.replica;
