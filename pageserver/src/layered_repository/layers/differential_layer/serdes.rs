@@ -10,8 +10,12 @@ use std::mem::size_of;
 use std::num::NonZeroU32;
 use std::ops::Deref;
 use lazy_static::lazy_static;
+use varuint::WriteVarint;
+use zenith_utils::bitpacking_lsns::LsnPacker;
 use zenith_utils::lsn::Lsn;
-use zenith_utils::multi_bitmap::{BitmappedMapPage, LayeredBitmap};
+use zenith_utils::multi_bitmap::{
+    BitmappedMapPage, BitmapStorageType, LayeredBitmap, MBitmap
+};
 use zenith_utils::vec_map::VecMap;
 
 use crate::layered_repository::filebufutils::{
@@ -28,6 +32,8 @@ use crate::layered_repository::storage_layer::{
 };
 use crate::{read_from_file, write_to_file, val_to_read, val_to_write};
 use crate::branches::BranchInfo;
+use crate::layered_repository::layers::differential_layer::wal_stream::WalStream;
+use crate::repository::WALRecord;
 
 lazy_static! {
     static ref BITMAP_HEIGHT: usize = f64::from(RELISH_SEG_SIZE as u32).log2().ceil() as usize;
@@ -35,9 +41,9 @@ lazy_static! {
 
 pub fn write_latest_metadata<T>(
     file: &mut BufWriter<T>,
-    mut offset: usize,
+    mut offset: u64,
     metadata: &InfoPageV1,
-) -> Result<usize>
+) -> Result<u64>
     where
         T: Write + Seek
 {
@@ -83,9 +89,9 @@ pub fn read_metadata<T>(
 /// returns the next free block number.
 pub fn write_old_page_versions_section<T>(
     file: &mut BufWriter<T>,
-    mut offset: usize,
+    mut offset: u64,
     previous_versions: &LayeredBitmap<Lsn>,
-) -> Result<usize>
+) -> Result<u64>
     where
         T: Write + Seek
 {
@@ -100,10 +106,10 @@ pub fn write_old_page_versions_section<T>(
 
 pub fn write_page_lineages_section<T>(
     file: &mut BufWriter<T>,
-    mut offset: usize,
+    mut offset: u64,
     previous_inner: &InMemoryLayerInner,
     page_lineages: &mut LayeredBitmap<LineagePointer>,
-) -> Result<usize>
+) -> Result<u64>
     where
         T: Write + Seek
 {
@@ -135,15 +141,15 @@ pub fn write_page_lineages_section<T>(
 /// Note that this is all WAL for one page in one block.
 pub fn write_vecmap_lineage_section<'a, F, T>(
     file: &mut BufWriter<F>,
-    mut offset: usize,
+    mut offset: u64,
     map: &VecMap<Lsn, T>,
     to_pageversion: &dyn Fn(&T) -> PageVersion,
-) -> Result<usize>
+) -> Result<u64>
     where
         F: Write + Seek,
         T: Copy + Clone + AsVersionType,
 {
-    let struct_location: usize = offset;
+    let struct_location: u64 = offset;
 
     // phase 1: Iterate over the map, and construct branches based on that data.
     let mut branches = Vec::<(Lsn, T, Vec<(Lsn, T)>)>::new();
@@ -200,140 +206,87 @@ pub fn write_vecmap_lineage_section<'a, F, T>(
 
     {
         let branch_infos_slice = &branch_infos[..];
-        res = write_to_file!(file, struct_location, descriptor, branch_infos_slice []);
+        let res = write_to_file!(file, struct_location, descriptor, branch_infos_slice []);
         offset = res?;
     }
 
-    for (branch_index, (lsn, head, versions)) in branches.iter().enumerate() {
-        let mut version_infos = Vec::with_capacity(versions.len());
-        let mut data_length = 0u64;
-
-        let head_page_version: PageVersion = to_pageversion(head);
-
-        if versions.len() == 0 {
-            let my_start= offset;
-            let typ: BranchPtrType;
-            match &head_page_version {
-                PageVersion::Page(bytes) => {
-                    let header = PageOnlyLineageBranchHeader {
-                        length: NonZeroU32::try_from(bytes.len() as u32).unwrap(),
-                    };
-                    let bytes = &bytes[..];
-                    let res = write_to_file!(file, offset, header, bytes []);
-                    offset = res?;
-                    typ = BranchPtrType::PageImage;
-                }
-                PageVersion::Wal(rec) => {
-                    let header = WalOnlyLineageBranchHeader {
-                        length: NonZeroU32::try_from(rec.rec.len() as u32).unwrap(),
-                        main_data_offset: rec.main_data_offset,
-                    };
-                    let bytes = &rec.rec[..];
-                    let res = write_to_file!(file, offset, header, bytes []);
-                    offset = res?;
-                    typ = BranchPtrType::WalRecord;
-                }
-            };
-
-            branch_infos[branch_index].branch_ptr_data.item_ptr =
-                UnalignFileOffset::from(my_start);
-            branch_infos[branch_index].branch_ptr_data.typ = typ;
-            branch_infos[branch_index].start_lsn = *lsn;
-            continue; // that's it for this branch
-        }
-
-        // Note: this allocates all WALRecords into memory, which is not great.
-        // The alternative, however, is to double-parse the WAL records, which is
-        // random IO and not great as well.
-        let mapped_tail_versions = versions
-            .iter()
-            .map(|(lsn, rec)| {
-                (
-                    *lsn,
-                    match to_pageversion(rec) {
-                        PageVersion::Page(_) => Err(anyhow!("PageVersion::Page in tail should be impossible"))?,
-                        PageVersion::Wal(rec) => rec,
-                    },
-                )
-            })
-            .collect::<Vec<_>>();
-
-        for (local_lsn, record) in mapped_tail_versions.iter() {
-            let length = NonZeroU32::try_from(record.rec.len() as u32).unwrap();
-            let main_data_offset = record.main_data_offset;
-
-            version_infos.push(VersionInfo {
-                lsn: local_lsn.0.to_ne_bytes(),
-                length,
-                main_data_offset,
-            });
-
-            data_length += u32::from(length) as u64;
-        }
-        let typ: BranchPtrType;
-        let header_bytes: &[u8];
-        let struct_start = offset;
-        offset = match &head_page_version {
-            PageVersion::Page(bytes) => {
-                let header = PageInitiatedLineageBranchHeader {
-                    num_entries: NonZeroU32::try_from(versions.len() as u32)?,
-                    head: PageOnlyLineageBranchHeader {
-                        length: NonZeroU32::try_from(bytes.len() as u32)?,
-                    },
-                };
-                typ = BranchPtrType::PageInitiatedBranch;
-                header_bytes = &bytes[..];
-                write_to_file!(file, offset, header)
-            }
-            PageVersion::Wal(rec) => {
-                typ = BranchPtrType::WalInitiatedBranch;
-
-                let header = WalInitiatedLineageBranchHeader {
-                    num_entries: NonZeroU32::try_from(versions.len() as u32)?,
-                    head: WalOnlyLineageBranchHeader {
-                        length: NonZeroU32::try_from(rec.rec.len() as u32)?,
-                        main_data_offset: rec.main_data_offset,
-                    },
-                };
-
-                header_bytes = &rec.rec[..];
-                write_to_file!(file, offset, header)
-            }
-        }?;
-        branch_infos[branch_index].branch_ptr_data.item_ptr =
-            UnalignFileOffset::from(struct_start);
-        branch_infos[branch_index].branch_ptr_data.typ = typ;
-        branch_infos[branch_index].start_lsn = *lsn;
-
-        {
-            let arr = &version_infos[..];
-            let res = write_to_file!(file, offset, version_infos [], header_bytes []);
-            offset = res?;
-        }
-
-        for (_, rec) in mapped_tail_versions {
-            let bytes = &rec.rec[..];
-            let res = write_to_file!(file, offset, bytes []);
-            offset = res?;
-        }
+    for (branch_index, (&start_lsn, head, versions)) in branches.iter().enumerate() {
+        let branch_ptr_data = write_branch(file, file.stream_position() as u64, head, start_lsn, &versions[..])?;
+        branch_infos.push(LineageBranchInfo {
+            start_lsn,
+            branch_ptr_data,
+        });
     }
 
     {
         let branch_infos_slice = &branch_infos[..];
-        res = write_to_file!(file, struct_location, descriptor, branch_infos_slice []);
+        let res = write_to_file!(file, struct_location, descriptor, branch_infos_slice []);
         res?;
     }
 
     return Ok(offset);
 }
 
+pub fn write_branch<File>(
+    file: &mut BufWriter<File>,
+    base_offset: u64,
+    head: &PageVersion,
+    lsn: Lsn,
+    versions: &[(Lsn, &WALRecord)],
+) -> Result<BranchPtrData>
+where
+    File: Write,
+{
+    if !versions.is_empty() {
+        let lsn_compressor = LsnPacker::new(lsn);
+
+        for (lsn, _) in versions {
+            lsn_compressor.add_lsn(*lsn);
+        }
+
+        let (_, num_items, meta, compressed) = lsn_compressor.finish();
+
+        WriteVarint::<u32>::write_varint(file, num_items as u32)?;
+        // We don't need to store the length of the metadata, nor that of the compressed data:
+        // The length of the metadata is implied by it's contents and num_items; and the length
+        // of the compressed data is implied by the contents of the metadata.
+        // Do note, howeveer, that this does mean we need to buffer whilst reading, and need to
+        // determine the size of our data whilst processing that data.
+        file.write_all(&meta[..])?;
+        file.write_all(&compressed[..])?;
+    };
+
+    let mut stream = WalStream::new(file);
+    let typ = match head {
+        PageVersion::Page(bytes) => {
+            stream.write_page(bytes)?;
+            BranchPtrType::PageImage.with_pagecount(versions.len())
+        },
+        PageVersion::Wal(rec) => {
+            stream.write_record(rec)?;
+            BranchPtrType::WalRecord.with_pagecount(versions.len())
+        },
+    };
+
+    for (_, rec) in versions {
+        stream.write_record(rec)?;
+    }
+
+    Ok(BranchPtrData {
+        item_ptr: UnalignFileOffset::from(base_offset),
+        typ,
+        extra_typ_info: 0,
+    })
+}
+
+
 pub fn write_bitmap_page_recursive<'a, File, T, R, M>(
     file: &mut BufWriter<File>,
-    base_offset: usize,
-    mut offset: usize,
+    base_offset: u64,
+    mut offset: u64,
     page: &BitmappedMapPage<T>,
     mapper: &M,
-) -> Result<usize>
+) -> Result<u64>
 where
     File: Write,
     T: Clone,
@@ -400,9 +353,9 @@ where
 /// returns the next free block number.
 pub fn write_page_versions_map<T>(
     file: &mut BufWriter<T>,
-    offset: usize,
+    offset: u64,
     map: &LayeredBitmap<LineagePointer>,
-) -> Result<usize>
+) -> Result<u64>
     where
         T: Write + Seek,
 {
@@ -427,12 +380,12 @@ pub fn read_bitmap_recursive<T, B, R, F>(
         R: Copy + Default,
         F: Fn(&R) -> B,
 {
-    let mut bits_store: <BitsImpl<RELISH_SEG_SIZE> as Bits>::Store = Default::default();
+    let mut bits_store: BitmapStorageType = Default::default();
     let base_offset = offset;
-    let res = read_from_file!(file, offset, bitmap);
-    let offset = res?;
+    let res = read_from_file!(file, offset, bits_store);
+    let mut offset = res?;
 
-    let bitmap = Bitmap::<RELISH_SEG_SIZE>::from_value(bits_store);
+    let bitmap = MBitmap::from_value(bits_store);
 
     match map {
         BitmappedMapPage::LeafPage { data } => {
@@ -534,12 +487,12 @@ pub fn read_old_page_versions_section(
 }
 
 pub fn read_lineage(
-    file: &File,
+    file: &mut File,
     offset: usize,
     restore_point: Option<Lsn>,
     seg_max_lsn: Lsn,
 ) -> Option<(Vec<(Lsn, PageVersion)>, Lsn)> {
-    const PTRS_PER_PAGE: usize = LAYER_BLOCK_SIZE / size_of::<LineageBranchInfo>();
+    const PTRS_PER_PAGE: usize = LAYER_PAGE_SIZE / size_of::<LineageBranchInfo>();
     let mut lineage_info: LineageInfo = LineageInfo::default();
 
     // If we need the latest version, we know that we only need one Branch's info.
@@ -575,9 +528,10 @@ pub fn read_lineage(
         }
     }
 
-    if local_branch_ptrs[0].start_lsn < restore_point {
+    // We always have at least one branch; so this is always safe.
+    if branch_ptrs_buf[0].start_lsn < restore_point {
         return Some((
-            local_branch_ptrs[0].iter(file).collect(),
+            branch_ptrs_buf[0].iter(file).collect(),
             seg_max_lsn,
         ))
     }
@@ -589,18 +543,24 @@ pub fn read_lineage(
         "Each lineage should always have at least one branch"
     );
 
-    const BRANCH_INFOS_LEN: usize = (lineage_info.num_branches as usize) * size_of::<LineageBranchInfo>();
+    let branch_infos_len: usize = (lineage_info.num_branches as usize) * size_of::<LineageBranchInfo>();
     let (mut local_branch_ptrs, _) = branch_ptrs_buf.split_at(PTRS_PER_PAGE.min(num_branches as usize));
 
-    const BRANCH_ARRAY_BASE_OFFSET: usize = offset + size_of::<LineageInfo>();
+    let branch_array_base_offset: usize = offset + size_of::<LineageInfo>();
 
-    fn read_local_branchinfos(offset: usize, branches: &mut Vec<LineageBranchInfo>) -> Result<(&[LineageBranchInfo], usize)> {
+    fn read_local_branchinfos<'a>(
+        file: &File,
+        offset: usize,
+        max_len: usize,
+        branches: &'a mut Vec<LineageBranchInfo>,
+        branch_array_base_offset: usize
+    ) -> Result<(&'a [LineageBranchInfo], usize)> {
         let page_start_item_offset = (offset / PTRS_PER_PAGE) * PTRS_PER_PAGE;
         let page_start_offset = page_start_item_offset * size_of::<LineageBranchInfo>();
 
-        let n_in_page = PTRS_PER_PAGE.min(BRANCH_INFOS_LEN - page_start_offset);
+        let n_in_page = PTRS_PER_PAGE.min(max_len - page_start_offset);
 
-        let read_start = page_start_offset + BRANCH_ARRAY_BASE_OFFSET;
+        let read_start = page_start_offset + branch_array_base_offset;
         branches.resize(n_in_page, LineageBranchInfo::default());
         let buf = &mut branches[..n_in_page];
         let res = read_from_file!(file, read_start, buf []);
@@ -665,7 +625,7 @@ pub fn read_lineage(
             }
             mid = (min + max) / 2;
             if mid > buf_offset + local_branch_ptrs.len() - 1 {
-                let res = read_local_branchinfos(mid, &mut branch_ptrs_buf)?;
+                let res = read_local_branchinfos(file, mid, branch_infos_len, &mut branch_ptrs_buf, branch_array_base_offset)?;
                 local_branch_ptrs = res.0;
                 buf_offset = res.1;
             }
@@ -694,7 +654,7 @@ pub fn read_lineage(
             break;
         }
 
-        let res = read_local_branchinfos(mid, &mut branch_ptrs_buf)?;
+        let res = read_local_branchinfos(file, mid, branch_infos_len, &mut branch_ptrs_buf, branch_array_base_offset)?;
         local_branch_ptrs = res.0;
         buf_offset = res.1;
     }
@@ -720,188 +680,9 @@ pub fn read_lineage(
 ///
 /// Note that this lsn_cutoff will not always be set; e.g. when the LSN requested is greater than
 /// the highest branch point of any branch it will not be changed.
-fn find_relevant_branchinfo<'a>(
-    file: &File,
-    lineage_info: LineageInfo,
-    offset: usize,
-    restore_point: Lsn,
-    lsn_cutoff: &mut Lsn,
-) -> Option<LineageBranchInfo> {
-    #[inline]
-    fn get_local_branch_infos<'b>(
-        offset: usize,
-        n_local_items: u32,
-        buf: &'b BufPage,
-    ) -> &'b [LineageBranchInfo] {
-        let len = n_local_items as usize * size_of::<LineageBranchInfo>();
-
-        debug_assert!(len + offset <= LAYER_PAGE_SIZE);
-
-        let datas: &'b [u8] = &buf.data()[offset..(offset + len)];
-        let (head, infos, tail) = unsafe { datas.align_to::<LineageBranchInfo>() };
-
-        debug_assert_eq!(tail.len(), 0);
-        debug_assert_eq!(head.len(), 0);
-        return infos;
-    }
-
-    const BRANCHES_PER_PAGE: usize = LAYER_PAGE_SIZE / size_of::<LineageBranchInfo>();
-
-    debug_assert!(lineage_info.num_branches > 0);
-
-    let mut left = 0usize;
-    let mut right = if restore_point.is_some() {
-        lineage_info.num_branches as usize - 1
-    } else {
-        0
-    };
-    let base_page: u32;
-    let mut is_local = false;
-
-    let n_page_local_branches = lineage_info
-        .num_branches
-        .min(((LAYER_PAGE_SIZE - offset as usize) / size_of::<LineageBranchInfo>()) as u32);
-
-    let mut local_branch_infos =
-        get_local_branch_infos(offset as usize, n_page_local_branches, &*buf);
-
-    let cutoff_lsn = restore_point.unwrap_or(Lsn::MAX);
-
-    // Page-local specialization for the first page of branches
-    if local_branch_infos.len() > 0 {
-        let newest_branch_info = &local_branch_infos[0];
-
-        if let Some(lsn) = restore_point {
-            // fast path: It is highly likely that we request the latest version of a page,
-            if newest_branch_info.start_lsn <= lsn {
-                return Some(*newest_branch_info);
-            }
-
-            // If the LSN is not on this first page, then we need to check the rest of the pages.
-            let oldest_local_branch_info = &local_branch_infos[local_branch_infos.len() - 1];
-
-            if oldest_local_branch_info.start_lsn > lsn {
-                left = 0;
-                base_page = blockno + 1;
-                right -= local_branch_infos.len();
-                *lsn_cutoff = oldest_local_branch_info.start_lsn;
-                is_local = false;
-            } else {
-                is_local = true;
-                base_page = blockno;
-                right = local_branch_infos.len() - 1;
-            }
-        } else {
-            return Some(*newest_branch_info);
-        }
-    } else {
-        base_page = blockno + 1;
-    }
-
-    loop {
-        if is_local {
-            break;
-        }
-        let mid = (left + right) / 2;
-        let buf_offno = mid / BRANCHES_PER_PAGE;
-
-        *buf = get_buf(file, base_page + (buf_offno as u32), my_buf);
-
-        let n_local_valid_branches =
-            BRANCHES_PER_PAGE.min(right - (buf_offno * BRANCHES_PER_PAGE) + 1) as u32;
-
-        local_branch_infos = get_local_branch_infos(0, n_local_valid_branches, &*buf);
-        if left == right {
-            is_local = true;
-            break;
-        }
-
-        let local_offset = mid - (buf_offno * BRANCHES_PER_PAGE);
-        let item = &local_branch_infos[local_offset];
-
-        match item.start_lsn.cmp(&cutoff_lsn).reverse() {
-            Ordering::Less => {
-                right = mid;
-
-                if local_offset != 0 {
-                    let item = &local_branch_infos[0];
-                    match item.start_lsn.cmp(&cutoff_lsn).reverse() {
-                        Ordering::Less => right = buf_offno * BRANCHES_PER_PAGE,
-                        Ordering::Equal => {
-                            return Some(*item);
-                        }
-                        Ordering::Greater => {
-                            left = buf_offno * BRANCHES_PER_PAGE;
-                            *lsn_cutoff = item.start_lsn;
-                            is_local = true;
-                        }
-                    }
-                }
-            }
-            Ordering::Greater => {
-                left = mid + 1;
-                *lsn_cutoff = item.start_lsn;
-
-                if local_offset != (n_local_valid_branches as usize) {
-                    let item = &local_branch_infos[n_local_valid_branches as usize - 1];
-                    match item.start_lsn.cmp(&cutoff_lsn).reverse() {
-                        Ordering::Less => {
-                            right =
-                                buf_offno * BRANCHES_PER_PAGE + n_local_valid_branches as usize - 1;
-                            is_local = true;
-                        }
-                        Ordering::Equal => {
-                            return Some(*item);
-                        }
-                        Ordering::Greater => {
-                            left = (buf_offno + 1) * BRANCHES_PER_PAGE;
-                            // The following condition is only possible if this last comparison was
-                            // on the very last page of the entries; in which we've just compared
-                            // the last branchinfo of this lineage and found that it does not
-                            // contain our LSN.
-                            *lsn_cutoff = item.start_lsn;
-                            if left > right {
-                                return None;
-                            }
-                        }
-                    }
-                }
-            }
-            Ordering::Equal => {
-                return Some(*item);
-            }
-        }
-    }
-
-    debug_assert!(is_local);
-
-    let restore_point = restore_point.unwrap();
-
-    return match local_branch_infos
-        .binary_search_by(|item| item.start_lsn.cmp(&restore_point).reverse())
-    {
-        Ok(off) => {
-            if off > 0 {
-                *lsn_cutoff = local_branch_infos[off - 1].start_lsn;
-            }
-
-            Some(local_branch_infos[off])
-        }
-        Err(off) => {
-            // The LSN is on this page, thus we must not be pointing past the end of the
-            // local_brance_infos array.
-            debug_assert!(off < local_branch_infos.len());
-            if off > 0 {
-                *lsn_cutoff = local_branch_infos[off - 1].start_lsn;
-            }
-
-            Some(local_branch_infos[off])
-        }
-    };
-}
 
 fn extract_branch_data(
-    file: &File,
+    file: &mut File,
     branch_info: &LineageBranchInfo,
     restore_point: Option<Lsn>,
     lsn_cutoff: &mut Lsn,

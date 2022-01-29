@@ -3,9 +3,12 @@ use bitmaps::{Bitmap, Bits, BitsImpl};
 use core::mem::size_of;
 use std::fmt::{Debug, Formatter};
 
-const PER_LAYER_SPECIFICITY_BITS: usize = 10;
-const N_BITS_PER_PAGE: usize = 1024; // 2usize.pow(PER_LAYER_SPECIFICITY_BITS as u32);
+pub const PER_LAYER_SPECIFICITY_BITS: usize = 10;
+pub const N_BITS_PER_PAGE: usize = 1024; // 2usize.pow(PER_LAYER_SPECIFICITY_BITS as u32);
 const LAYER_BITMASK: usize = N_BITS_PER_PAGE - 1usize;
+
+pub type BitmapStorageType = <BitsImpl<N_BITS_PER_PAGE> as Bits>::Store;
+pub type MBitmap = Bitmap<N_BITS_PER_PAGE>;
 
 fn le_popcnt(it: Bitmap<N_BITS_PER_PAGE>, len: usize) -> usize {
     (Bitmap::<N_BITS_PER_PAGE>::mask(len) & it).len()

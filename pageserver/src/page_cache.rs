@@ -62,7 +62,7 @@ use crate::layered_repository::storage_layer::SegmentTag;
 static PAGE_CACHE: OnceCell<PageCache> = OnceCell::new();
 const TEST_PAGE_CACHE_SIZE: usize = 10;
 
-#[repr(C, align(PAGE_SZ))]
+#[repr(C, align(8192))]
 #[derive(Debug)]
 pub struct BufPage { data: [u8; PAGE_SZ] }
 
@@ -118,11 +118,6 @@ enum CacheKey {
         file_id: u64,
         blkno: u32,
     },
-    LayerPage {
-        layer_key: LayerKey,
-        blockno: u32,
-        file_ref: Arc<File>,
-    }
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
@@ -820,7 +815,7 @@ impl PageCache {
         let slots = page_buffer
             .iter_mut()
             .map(|chunk| {
-                let buf: &mut [u8; PAGE_SZ] = chunk.data.try_into().unwrap();
+                let buf: &mut [u8; PAGE_SZ] = &mut chunk.data;
 
                 Slot {
                     inner: RwLock::new(SlotInner {

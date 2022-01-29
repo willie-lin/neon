@@ -1,3 +1,5 @@
+/// Iterator types on the differential layer's data types.
+
 use crate::layered_repository::filebufutils::{get_buf, read_slice_from_blocky_file, BufPage};
 use crate::layered_repository::layers::differential_layer::file_format::{
     BranchPtrType, LineageBranchInfo, LineageInfo, PageInitiatedLineageBranchHeader,
@@ -14,40 +16,53 @@ use parking_lot::RwLock;
 use std::fs::File;
 use core::mem::{align_of, size_of};
 use core::num::NonZeroU32;
+use std::cmp::Ordering;
 use hyper::Version;
 use zenith_utils::lsn::Lsn;
-use crate::read_from_file;
+use crate::{read_from_file, val_to_read};
 
 const VERSIONS_PER_PAGE: usize = LAYER_PAGE_SIZE / size_of::<VersionInfo>();
 const BRANCHINFOS_PER_PAGE: usize = LAYER_PAGE_SIZE / size_of::<LineageBranchInfo>();
 
 impl LineageBranchInfo {
-    pub fn iter<'a>(&self, file: &'a File) -> LineageBranchVersionIterator<'a> {
+    pub fn iter<'a>(&self, file: &'a mut File) -> LineageBranchVersionIterator<'a> {
         return LineageBranchVersionIterator::new(file, *self);
     }
 }
 
 pub struct LineageBranchVersionIterator<'a> {
-    file: &'a File,
+    /// The file we're reading from
+    file: &'a mut File,
+    /// the branch descriptor that we're iterating over
     branch: LineageBranchInfo,
+    /// The last returned index of the iterator. None if none have been returned yet.
     versionarray_index: Option<usize>,
-    current_data_file_offset: usize,
+    /// The current offset of the start of the data buffer in the file;
+    current_file_data_offset: usize,
+    /// The offset of the end of the version infos buffer in the file.
     next_version_infos_file_offset: usize,
+    /// Buffer holding version infos.
+    /// NB: Length is unrelated to n_total_versions; this buffer might be larger than that.
     version_infos_buf: Vec<VersionInfo>,
+    /// The index of the first version info in the buffer; i.e. how many version infos of
+    /// the branch are located before the first one in the buffer.
     version_infos_buf_first_version_offset: usize,
+    /// Buffer holding data bytes for the versioninfos.
     data_buf: Vec<u8>,
+    /// The index of the first not-yet-used data byte.
     data_buf_first_unused: usize,
+    /// The total number of versions in this branch.
     n_total_versions: usize,
 }
 
 impl<'a> LineageBranchVersionIterator<'a> {
-    fn new(file: &'a File, branch: LineageBranchInfo) -> Self {
+    fn new(file: &'a mut File, branch: LineageBranchInfo) -> Self {
         LineageBranchVersionIterator {
             file,
             branch,
             next_version_infos_file_offset: branch.branch_ptr_data.item_ptr.full_offset(),
             versionarray_index: None,
-            current_data_file_offset: 0usize,
+            current_file_data_offset: 0usize,
             version_infos_buf: vec![],
             version_infos_buf_first_version_offset: 0,
             data_buf: vec![],
@@ -64,7 +79,8 @@ impl<'a> LineageBranchVersionIterator<'a> {
         {
             let file = self.file;
             let read_buf = &mut self.version_infos_buf[..];
-            read_from_file!(file, self.next_version_infos_file_offset, read_buf []);
+            let mut offset = self.next_version_infos_file_offset as u64;
+            read_from_file!(file, offset, read_buf []);
         }
 
         self.next_version_infos_file_offset += 1;
@@ -107,7 +123,7 @@ impl<'a> Iterator for LineageBranchVersionIterator<'a> {
         }
 
         impl InitializedBranch {
-            fn num_items(&self) -> NonZeroU32 {
+            fn num_items(&self) -> u32 {
                 match self {
                     InitializedBranch::Page(it) => it.num_entries,
                     InitializedBranch::Wal(it) => it.num_entries,
@@ -134,7 +150,7 @@ impl<'a> Iterator for LineageBranchVersionIterator<'a> {
                 let typ: InitializedBranch;
                 let mut offset = branch_hdr_ptr.full_offset();
 
-                match branch.branch_ptr_data.typ {
+                match self.branch.branch_ptr_data.typ {
                     BranchPtrType::PageImage => {
                         let mut header = PageOnlyLineageBranchHeader::default();
 
@@ -219,7 +235,7 @@ impl<'a> Iterator for LineageBranchVersionIterator<'a> {
 
                         self.version_infos_buf.extend_from_slice(data);
 
-                        self.current_data_file_offset = self.branch.branch_ptr_data.item_ptr.full_offset()
+                        self.current_file_data_offset = self.branch.branch_ptr_data.item_ptr.full_offset()
                             + size_of::<PageInitiatedLineageBranchHeader>()
                             + self.n_total_versions * size_of::<VersionInfo>();
 
@@ -249,7 +265,7 @@ impl<'a> Iterator for LineageBranchVersionIterator<'a> {
 
                         self.version_infos_buf.extend_from_slice(data);
 
-                        self.current_data_file_offset = self.branch.branch_ptr_data.item_ptr.full_offset()
+                        self.current_file_data_offset = self.branch.branch_ptr_data.item_ptr.full_offset()
                             + size_of::<WalInitiatedLineageBranchHeader>()
                             + self.n_total_versions * size_of::<VersionInfo>();
 
@@ -257,31 +273,26 @@ impl<'a> Iterator for LineageBranchVersionIterator<'a> {
                     }
                 }
 
-                if (typ.data_len() as usize) < data_buf_mut.len() && self.n_total_versions == self.version_infos_buf.len() {
-                    let bytes = Bytes::from(data_buf_mut.to_vec());
+                self.data_buf = data_buf;
+
+                // We've initialized the iterator fields, now all we need to do is return the first value
+
+                // If the first value is already buffered, we can simply return it.
+                if typ.data_len() <= data_buf_mut.len() && self.n_total_versions == n_local_versions {
+                    self.data_buf_first_unused = typ.data_len() as usize;
+                    let mut bytes = Bytes::from(Vec::from(&data_buf_mut[..typ.data_len() as usize]));
+
                     return Some((
                         self.branch.start_lsn,
                         match typ {
-                            InitializedBranch::Page(_) => {
-                                PageVersion::Page(bytes)
-                            }
-                            InitializedBranch::Wal(header) => {
+                            InitializedBranch::Page(_) => PageVersion::Page(bytes),
+                            InitializedBranch::Wal(rec) =>
                                 PageVersion::Wal(WALRecord {
                                     will_init: true,
                                     rec: bytes,
-                                    main_data_offset: header.head.main_data_offset,
+                                    main_data_offset: rec.head.main_data_offset,
                                 })
-                            }
-                        },
-                    ));
-                }
-
-                self.data_buf = data_buf;
-
-                if typ.data_len() <= data_buf_mut.len() && self.n_total_versions == n_local_versions {
-                    return Some((
-                        self.branch.start_lsn,
-                        PageVersion::Page(Bytes::from(Box::new(data_buf_mut[..header.length as usize]))),
+                        }
                     ))
                 }
 
@@ -292,16 +303,25 @@ impl<'a> Iterator for LineageBranchVersionIterator<'a> {
                 self.data_buf.resize(LAYER_PAGE_SIZE.max(typ.data_len() as usize), 0u8);
 
                 {
-                    offset = self.current_data_file_offset;
+                    offset = self.current_file_data_offset;
                     let data_buf_mut = &mut self.data_buf[..];
                     let res = read_from_file!(self.file, offset, data_buf_mut []);
-                    self.current_data_file_offset = res?;
+                    self.current_file_data_offset = res?;
                 }
                 self.data_buf_first_unused = typ.data_len() as usize;
+                let bytes = Bytes::from(Vec::from(&self.data_buf[..typ.data_len() as usize]));
 
                 return Some((
                     self.branch.start_lsn,
-                    PageVersion::Page(Bytes::from(Box::new(self.data_buf[..typ.data_len()]))),
+                    match typ {
+                        InitializedBranch::Page(_) => PageVersion::Page(bytes),
+                        InitializedBranch::Wal(rec) =>
+                            PageVersion::Wal(WALRecord {
+                                will_init: true,
+                                rec: bytes,
+                                main_data_offset: rec.head.main_data_offset,
+                            })
+                    }
                 ));
             }
             Some(index) => {
@@ -325,7 +345,7 @@ impl<'a> Iterator for LineageBranchVersionIterator<'a> {
                     self.data_buf.resize(LAYER_PAGE_SIZE.max(version_info.length as usize), 0u8);
 
                     {
-                        let offset = self.current_data_file_offset;
+                        let offset = self.current_file_data_offset;
                         let data_buf_mut = &mut self.data_buf[..];
 
                         let res = read_from_file!(self.file, offset, data_buf_mut []);
@@ -337,7 +357,7 @@ impl<'a> Iterator for LineageBranchVersionIterator<'a> {
 
                 let bytes = Bytes::from(Box::new(self.data_buf[self.data_buf_first_unused..(self.data_buf_first_unused + version_info.length as usize)]));
                 self.data_buf_first_unused += version_info.length as usize;
-                self.current_data_file_offset += version_info.length as u64;
+                self.current_file_data_offset += version_info.length as usize;
 
                 self.versionarray_index = Some(index + 1);
 
@@ -365,12 +385,19 @@ impl<'a> Iterator for LineageBranchVersionIterator<'a> {
 }
 
 pub struct LineageBranchIterator<'a> {
+    /// The file we're reading from.
     file: &'a File,
+    /// The lineage pointer we're iterating over
     start_ptr: LineagePointer,
+    /// The index of the last returned branch [in the lineage]
     branchversions_index: Option<usize>,
-    next_branches_block: u32,
+    /// The file offset of the end of the branch_infos_buf
+    next_branches_offset: usize,
+    /// A buffer holding a section of lineage's branch pointers.
     branch_infos_buf: Vec<LineageBranchInfo>,
+    /// The start of the buffers' contents in the lineage's branches array
     branch_infos_buf_start: usize,
+    /// The total number of branches in the lineage
     n_total_branches: usize,
 }
 
@@ -378,10 +405,10 @@ impl LineagePointer {
     pub(crate) fn iter<'a>(&self, file: &'a File) -> LineageBranchIterator<'a> {
         LineageBranchIterator {
             file,
-            start_ptr: *self,
+            start_ptr: self.clone(),
             branchversions_index: None,
-            next_branches_block: 0,   // filled at first iteration
-            branch_infos_buf: vec![], // empty by default, no extra allocation
+            next_branches_offset: 0,   // filled at first iteration
+            branch_infos_buf: Vec::new(), // empty by default, no extra allocation
             branch_infos_buf_start: 0,
             n_total_branches: 0,
         }
@@ -394,34 +421,31 @@ impl<'a> LineageBranchIterator<'a> {
             file,
             start_ptr,
             branchversions_index: None,
-            next_branches_block: 0,
+            next_branches_offset: start_ptr.0.full_offset(),
             branch_infos_buf: Vec::new(),
             branch_infos_buf_start: 0,
             n_total_branches: 0,
         }
     }
 
-    fn buffer_next_section(&mut self) {
-        let my_buf: RwLock<BufPage> = RwLock::new(BufPage::default());
+    fn buffer_next_section(&mut self) -> Result<()> {
         self.branch_infos_buf_start += self.branch_infos_buf.len();
-        let buf = get_buf(self.file, self.next_branches_block, &my_buf);
 
-        let n_local_branches =
-            VERSIONS_PER_PAGE.min(self.n_total_branches - self.branch_infos_buf_start);
-        let branches = {
-            let (versions_data, _) = buf
-                .data()
-                .split_at(n_local_branches * size_of::<LineageBranchInfo>());
-            let (head, arr, tail) = unsafe { versions_data.align_to::<LineageBranchInfo>() };
-            assert!(head.is_empty());
-            assert!(tail.is_empty());
-            assert_eq!(arr.len(), n_local_branches);
-            arr
-        };
+        let remaining_items = self.n_total_branches - self.branch_infos_buf_start;
 
-        self.branch_infos_buf.clear();
-        self.branch_infos_buf.extend_from_slice(branches);
-        self.next_branches_block += 1;
+        self.branch_infos_buf.resize(
+            remaining_items.min(LAYER_PAGE_SIZE / size_of::<LineageBranchInfo>()),
+            LineageBranchInfo::default()
+        );
+        let offset = self.next_branches_offset;
+
+        let infos_buf = &mut self.branch_infos_buf[..];
+
+        let res = read_from_file!(self.file, offset, infos_buf []);
+        res?;
+
+        self.next_branches_offset += self.branch_infos_buf.len();
+        Ok(())
     }
 
     fn peek_lsn(&mut self) -> Option<Lsn> {
@@ -446,53 +470,36 @@ impl<'a> LineageBranchIterator<'a> {
 impl<'a> Iterator for LineageBranchIterator<'a> {
     type Item = LineageBranchInfo;
 
-    fn next(&mut self) -> Option<Self::Item> {
-        let my_buf = RwLock::new(BufPage::default());
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match &self.branchversions_index {
+            None => {
+                (1, None)
+            }
+            Some(_) => {
+                (self.n_total_branches, Some(self.n_total_branches))
+            }
+        }
+    }
 
+    fn next(&mut self) -> Option<Self::Item> {
         match self.branchversions_index {
             None => {
-                // setup iteration
                 self.branchversions_index = Some(0);
-                let blockno = self.start_ptr.0.blockno();
-                let offset = self.start_ptr.0.offset();
 
-                let mut buf = get_buf(self.file, blockno, &my_buf);
+                let offset = self.start_ptr.0.full_offset();
+                let lineage_info = LineageInfo::default();
+                let lineage_infos_buf = vec![LineageBranchInfo::default(); LAYER_PAGE_SIZE / size_of::<LineageBranchInfo>()];
 
-                let (header, branchinfos) =
-                    buf.data()[(offset as usize)..].split_at(size_of::<LineageInfo>());
-                let header = {
-                    let (lead, data, tail) = unsafe { header.align_to::<LineageInfo>() };
-                    debug_assert!(lead.is_empty());
-                    debug_assert!(tail.is_empty());
-                    debug_assert_eq!(data.len(), 1);
-                    &data[0]
-                };
+                let res = read_from_file!(self.file, offset, lineage_info, lineage_infos_buf []);
 
-                let local_branchinfos = {
-                    let (lead, data, tail) = unsafe { branchinfos.align_to::<LineageBranchInfo>() };
-                    debug_assert!(lead.is_empty());
-                    debug_assert!(tail.is_empty());
-                    debug_assert_eq!(data.len(), 1);
-                    data
-                };
-                let n_local_branches = local_branchinfos.len();
+                self.next_branches_offset = res?;
 
-                self.n_total_branches = header.num_branches as usize;
+                self.n_total_branches = lineage_info.num_branches as usize;
+                let lineage_infos = &lineage_infos_buf[..self.n_total_branches.min(LAYER_PAGE_SIZE / size_of::<LineageBranchInfo>())];
                 self.branch_infos_buf.clear();
-                self.branch_infos_buf.reserve(
-                    self.n_total_branches
-                        .min(n_local_branches.max(self.n_total_branches - n_local_branches))
-                        .min(BRANCHINFOS_PER_PAGE),
-                );
-                self.branch_infos_buf_start = 0;
-                self.branch_infos_buf.extend_from_slice(local_branchinfos);
-                self.next_branches_block = blockno + 1;
+                self.branch_infos_buf.extend_from_slice(lineage_infos);
 
-                if n_local_branches == 0 {
-                    self.buffer_next_section();
-                }
-
-                return Some(self.branch_infos_buf[0]);
+                Some(self.branch_infos_buf[0])
             }
             Some(index) => {
                 if index >= self.n_total_branches {

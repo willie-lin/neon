@@ -53,6 +53,7 @@ pub mod nonblock;
 
 // Default signal handling
 pub mod signals;
+pub mod bitpacking_lsns;
 
 // This is a shortcut to embed git sha into binaries and avoid copying the same build script to all packages
 //

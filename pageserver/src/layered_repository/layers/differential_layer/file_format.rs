@@ -1,3 +1,4 @@
+/// Data and storage types for the differential layer v1.
 use crate::layered_repository::layers::LAYER_PAGE_SIZE;
 use static_assertions::{const_assert, const_assert_eq};
 use std::mem::size_of;
@@ -13,14 +14,7 @@ pub struct UnalignFileOffset {
 }
 
 impl UnalignFileOffset {
-    pub fn new(blockno: u32, offset: u16) -> Self {
-        Self {
-            hi: (blockno >> 16) as u16,
-            mid: (blockno & 0xFFFF) as u16,
-            low: offset,
-        }
-    }
-    pub fn from(offset: usize) -> Self {
+    pub fn from(offset: u64) -> Self {
         Self {
             hi: ((offset >> 32) & 0xFFFF) as u16,
             mid: ((offset >> 16) & 0xFFFF) as u16,
@@ -36,19 +30,19 @@ impl UnalignFileOffset {
         self.low
     }
 
-    pub fn full_offset(&self) -> usize {
-        (self.hi as usize) << 32 | (self.mid as usize) << 16 | (self.low as usize)
+    pub fn full_offset(&self) -> u64 {
+        (self.hi as u64) << 32 | (self.mid as u64) << 16 | (self.low as u64)
     }
 }
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
 pub struct InfoPageV1 {
-    pub old_page_versions_map_start: usize,
-    pub new_page_versions_map_start: usize,
-    pub page_lineages_start: usize,
-    pub page_images_start: usize,
-    pub seg_lengths_start: usize,
+    pub old_page_versions_map_start: u64,
+    pub new_page_versions_map_start: u64,
+    pub page_lineages_start: u64,
+    pub page_images_start: u64,
+    pub seg_lengths_start: u64,
 }
 
 // Used for size assertion checks.
@@ -84,7 +78,7 @@ impl Default for LineageBranchInfo {
             start_lsn: Lsn::default(),
             branch_ptr_data: BranchPtrData {
                 item_ptr: Default::default(),
-                tail_padding: 0,
+                extra_typ_info: 0,
                 typ: BranchPtrType::PageImage,
             },
         }
@@ -102,7 +96,7 @@ impl Default for LineageBranchInfo {
 #[repr(C, align(4))]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
 pub struct WalInitiatedLineageBranchHeader {
-    pub num_entries: NonZeroU32,
+    pub num_entries: u32,
     pub head: WalOnlyLineageBranchHeader,
 }
 #[repr(C, align(4))]
@@ -122,9 +116,10 @@ pub struct WalOnlyLineageBranchHeader {
 #[repr(C, align(4))]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
 pub struct PageInitiatedLineageBranchHeader {
-    pub num_entries: NonZeroU32,
+    pub num_entries: u32,
     pub head: PageOnlyLineageBranchHeader,
 }
+
 #[repr(C, align(4))]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
 pub struct PageOnlyLineageBranchHeader {
@@ -140,7 +135,7 @@ pub struct PageOnlyLineageBranchHeader {
 #[repr(C, align(4))]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct VersionInfo {
-    pub lsn: [u8; 8],
+    pub lsn: [u8; size_of::<u64>()],
     pub length: NonZeroU32,
     pub main_data_offset: NonZeroU32,
 }
@@ -167,12 +162,29 @@ pub enum BranchPtrType {
     WalInitiatedBranch,
 }
 
+impl BranchPtrType {
+    pub fn with_pagecount(self, pagecount: usize) -> Self {
+        match pagecount {
+            0 => match self {
+                BranchPtrType::PageInitiatedBranch => BranchPtrType::PageImage,
+                BranchPtrType::WalInitiatedBranch => BranchPtrType::WalRecord,
+                _ => self,
+            },
+            _ => match self {
+                BranchPtrType::PageImage => BranchPtrType::PageInitiatedBranch,
+                BranchPtrType::WalRecord => BranchPtrType::WalInitiatedBranch,
+                _ => self,
+            }
+        }
+    }
+}
+
 #[repr(C, align(8))]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct BranchPtrData {
     pub item_ptr: UnalignFileOffset,
-    pub tail_padding: u8,
     pub typ: BranchPtrType,
+    pub extra_typ_info: u8,
 }
 
 // expected struct size: 8 bytes;

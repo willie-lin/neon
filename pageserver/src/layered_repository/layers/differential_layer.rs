@@ -40,6 +40,9 @@
 pub mod file_format;
 mod iter;
 mod serdes;
+mod wal_stream;
+mod page_io;
+mod lsn_stream;
 
 use crate::layered_repository::filename::{DeltaFileName, DeltaLayerType, PathOrConf};
 use crate::layered_repository::storage_layer::{
@@ -283,8 +286,7 @@ impl Layer for DifferentialLayer {
 
             let res = read_lineage(
                 &inner.file,
-                lineagepointer.0.blockno(),
-                lineagepointer.0.offset(),
+                lineagepointer.0.full_offset(),
                 Some(lsn),
             );
 
@@ -556,7 +558,7 @@ impl DifferentialLayer {
             .write(true)
             .read(true)
             .open(&buf)?);
-        let mut offset = 0usize;
+        let mut offset = 0u64;
 
         offset = write_latest_metadata(&mut bufwriter, offset, &meta)?;
 

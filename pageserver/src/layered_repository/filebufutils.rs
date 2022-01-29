@@ -146,28 +146,18 @@ where
 #[macro_export]
 macro_rules! val_to_write (
     ( $val:ident ) => {
-        let tmp = core::slice::from_ref(& $val );
-        let (_, bytes, _) = unsafe { tmp.align_to::<u8>() };
-        IoSlice::new(bytes)
+        {
+            let tmp = core::slice::from_ref(& $val );
+            let (_, bytes, _) = unsafe { tmp.align_to::<u8>() };
+            std::io::IoSlice::new(bytes)
+        }
     };
-    ( $drop:pat ; $val:ident) => {
-        let tmp = & $val [..];
-        let (_, bytes, _) = unsafe { tmp.align_to::<u8>() };
-        IoSlice::new(bytes)
-    };
-);
-
-#[macro_export]
-macro_rules! val_to_read (
-    ( $val:ident ) => {
-        let tmp = core::slice::from_mut(& $val );
-        let (_, bytes, _) = unsafe { tmp.align_to::<u8>() };
-        IoSliceMut::new(bytes)
-    };
-    ( $drop:pat ; $val:ident) => {
-        let tmp = &mut $val [..];
-        let (_, bytes, _) = unsafe { tmp.align_to_mut::<u8>() };
-        IoSliceMut::new(bytes)
+    ( $drop:pat => $val:ident) => {
+        {
+            let tmp = & $val [..];
+            let (_, bytes, _) = unsafe { tmp.align_to::<u8>() };
+            std::io::IoSlice::new(bytes)
+        }
     };
 );
 
@@ -177,13 +167,13 @@ macro_rules! write_to_file (
         {
             let mut bufs = vec![ ( $(
                 {
-                    val_to_write!( $( $p ; )? $val )
+                    val_to_write!( $( $p => )? $val )
                 }
             ),+ )];
 
-            let mut bufs_ref: &mut [IoSlice] = &mut bufs[..];
+            let mut bufs_ref: &mut [std::io::IoSlice] = &mut bufs[..];
 
-            $writer.seek(SeekFrom::Start($offset))?;
+            $writer.seek(std::io::SeekFrom::Start($offset))?;
 
             loop {
                 let mut len_written = std::io::Write::write_vectored($writer, bufs_ref)?;
@@ -194,7 +184,7 @@ macro_rules! write_to_file (
                         len_written -= bufs_ref[0].len();
                         bufs_ref = &mut bufs_ref[1..];
                     } else {
-                        bufs_ref[0] = IoSlice::new(bufs_ref[0].split_at(len_written).1);
+                        bufs_ref[0] = std::io::IoSlice::new(bufs_ref[0].split_at(len_written).1);
                         break;
                     }
                 }
@@ -210,17 +200,36 @@ macro_rules! write_to_file (
 );
 
 #[macro_export]
+macro_rules! val_to_read (
+    ( $val:ident ) => {
+        {
+            let tmp = core::slice::from_mut(& $val );
+            let (_, bytes, _) = unsafe { tmp.align_to::<u8>() };
+            std::io::IoSliceMut::new(bytes)
+        }
+    };
+    ( $drop:pat => $val:ident) => {
+        {
+            let tmp = &mut $val [..];
+            let (_, bytes, _) = unsafe { tmp.align_to_mut::<u8>() };
+            std::io::IoSliceMut::new(bytes)
+        }
+    };
+);
+
+
+#[macro_export]
 macro_rules! read_from_file (
-    ( $writer:ident, $offset:ident, $( $val:ident $( $p:pat )? ),+ ) => {
+    ( $writer:expr, $offset:ident, $( $val:ident $( $p:pat )? ),+ ) => {
         {
             let mut bufs = vec![ $(
                 {
-                    val_to_read!( $( $p ; )? $val )
+                    val_to_read!( $( $p => )? $val )
                 }
             ),+ ];
-            let mut bufs_ref: &mut [IoSliceMut] = &mut bufs[..];
+            let mut bufs_ref: &mut [std::io::IoSliceMut] = &mut bufs[..];
 
-            $writer.seek(SeekFrom::Start($offset))?;
+            std::io::Seek::seek($writer, std::io::SeekFrom::Start($offset))?;
 
             loop {
                 let mut len_read = std::io::Read::read_vectored($writer, bufs_ref)?;
@@ -232,7 +241,7 @@ macro_rules! read_from_file (
                         bufs_ref = &mut bufs_ref[1..];
                     } else {
                         // We now have fully processed the read components.
-                        bufs_ref[0] = IoSliceMut::new(bufs_ref[0].split_at_mut(len_read).1);
+                        bufs_ref[0] = std::io::IoSliceMut::new(bufs_ref[0].split_at_mut(len_read).1);
                         break;
                     }
                 }

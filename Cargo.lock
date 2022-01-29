@@ -1148,6 +1148,7 @@ dependencies = [
  "serde_json",
  "signal-hook",
  "static_assertions",
+ "tantivy-bitpacker",
  "tar",
  "tempfile",
  "thiserror",
@@ -1156,6 +1157,7 @@ dependencies = [
  "tracing",
  "tracing-futures",
  "url",
+ "varuint",
  "workspace_hack",
  "zenith_metrics",
  "zenith_utils",
@@ -1897,6 +1899,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "tantivy-bitpacker"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "66d10a5ed75437a4f6bbbba67601cd5adab8d71f5188b677055381f0f36064f2"
+
+[[package]]
 name = "tar"
 version = "0.4.37"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2226,6 +2234,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "varuint"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "896414bb0f21aba00ff26b0a8a3679331b5a86886f217c9d9396b919a7bf4ac6"
+
+[[package]]
 name = "vec_map"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2551,11 +2565,13 @@ dependencies = [
  "serde",
  "serde_json",
  "signal-hook",
+ "tantivy-bitpacker",
  "tempfile",
  "thiserror",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "varuint",
  "webpki 0.21.4",
  "workspace_hack",
  "zenith_metrics",
