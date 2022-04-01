@@ -115,6 +115,12 @@ jobs:
             target/
           key: v1-${{ runner.os }}-${{ matrix.build_type }}-cargo-${{ matrix.rust_toolchain }}-${{ hashFiles('Cargo.lock') }}
 
+      - name: Install zld
+        run: |
+          brew tap michaeleisel/zld
+          brew install zld
+          which zld
+
       - name: Run cargo build
         run: |
           if [[ $BUILD_TYPE == "debug" ]]; then
@@ -122,7 +128,7 @@ jobs:
           elif [[ $BUILD_TYPE == "release" ]]; then
             CARGO_FLAGS=--release
           fi
-          cargo build $CARGO_FLAGS --bins --tests
+          RUSTFLAGS="-C link-arg=-fuse-ld=$(which zld)" cargo build $CARGO_FLAGS --bins --tests
 
       - name: Run cargo test
         run: |
@@ -131,7 +137,7 @@ jobs:
           elif [[ $BUILD_TYPE == "release" ]]; then
             CARGO_FLAGS=--release
           fi
-          cargo test $CARGO_FLAGS
+          RUSTFLAGS="-C link-arg=-fuse-ld=$(which zld)" cargo test $CARGO_FLAGS
 
       - name: Prepare zenith binaries for upload
         run: |
@@ -142,12 +148,12 @@ jobs:
           fi
 
           binaries=$(
-            cargo metadata --format-version=1 --no-deps |
+            RUSTFLAGS="-C link-arg=-fuse-ld=$(which zld)" cargo metadata --format-version=1 --no-deps |
             jq -r '.packages[].targets[] | select(.kind | index("bin")) | .name'
           )
 
           test_exe_paths=$(
-            cargo test $CARGO_FLAGS --message-format=json --no-run |
+            RUSTFLAGS="-C link-arg=-fuse-ld=$(which zld)" cargo test $CARGO_FLAGS --message-format=json --no-run |
             jq -r '.executable | select(. != null)'
           )
 
@@ -173,89 +179,88 @@ jobs:
           fi
 
           tar -C /tmp/zenith/ -cf ./zenith.tgz ./bin/ ./test_bin/ ./etc/
-
-      - name: Upload zenith binaries
-        uses: actions/upload-artifact@v3
-        with:
-          retention-days: 7
-          if-no-files-found: error
-          name: zenith-${{ runner.os }}-${{ matrix.build_type }}-${{ matrix.rust_toolchain }}-artifact
-          path: ./zenith.tgz
-
-  # TOOD kb disable python tests for non-main branches (artifact uploads also?)
-  python-regress-tests:
-    needs: build-zenith
-    strategy:
-      matrix:
-        build_type: [debug, release]
-        rust_toolchain: [1.56]
-    timeout-minutes: 40
-    name: run python regression test suite (macOs)
-    runs-on: macos-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-        with:
-          submodules: true
-          fetch-depth: 2
-
-      - name: Pytest regress tests
-        env:
-          PERF_TEST_RESULT_CONNSTR: "${{ secrets.PERF_TEST_RESULT_CONNSTR }}"
-        uses: ./.github/actions/run-python-test-set
-        with:
-          build_type: ${{ matrix.build_type }}
-          rust_toolchain: ${{ matrix.rust_toolchain }}
-          track_coverage: false
-          test_selection: batch_pg_regress
-
-  python-other-tests:
-    # FIXME: disable the other tests suite for macOs: it's able to run up to ~94% now,
-    # but one of the tests hangs and never completes, thus failing the job on a timeout
-    if: ${{ 'one' == 'two' }}
-    needs: build-zenith
-    strategy:
-      matrix:
-        build_type: [debug, release]
-        rust_toolchain: [1.56]
-    timeout-minutes: 40
-    name: run python other tests suite (macOs)
-    runs-on: macos-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-
-      - name: Pytest other tests
-        uses: ./.github/actions/run-python-test-set
-        with:
-          build_type: ${{ matrix.build_type }}
-          rust_toolchain: ${{ matrix.rust_toolchain }}
-          track_coverage: false
-          test_selection: batch_others
-
-  python-performance-tests:
-    needs: build-zenith
-    strategy:
-      matrix:
-        build_type: [release]
-        rust_toolchain: [1.56]
-    timeout-minutes: 40
-    name: run python performance tests suite (macOs)
-    runs-on: macos-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-
-      - name: Pytest performance tests
-        env:
-          PERF_TEST_RESULT_CONNSTR: "${{ secrets.PERF_TEST_RESULT_CONNSTR }}"
-        uses: ./.github/actions/run-python-test-set
-        with:
-          build_type: ${{ matrix.build_type }}
-          rust_toolchain: ${{ matrix.rust_toolchain }}
-          save_perf_report: true
-          run_in_parallel: false
-          test_selection: performance
+#
+#      - name: Upload zenith binaries
+#        uses: actions/upload-artifact@v3
+#        with:
+#          retention-days: 7
+#          if-no-files-found: error
+#          name: zenith-${{ runner.os }}-${{ matrix.build_type }}-${{ matrix.rust_toolchain }}-artifact
+#          path: ./zenith.tgz
+#
+#  python-regress-tests:
+#    needs: build-zenith
+#    strategy:
+#      matrix:
+#        build_type: [debug, release]
+#        rust_toolchain: [1.56]
+#    timeout-minutes: 40
+#    name: run python regression test suite (macOs)
+#    runs-on: macos-latest
+#
+#    steps:
+#      - name: Checkout
+#        uses: actions/checkout@v3
+#        with:
+#          submodules: true
+#          fetch-depth: 2
+#
+#      - name: Pytest regress tests
+#        env:
+#          PERF_TEST_RESULT_CONNSTR: "${{ secrets.PERF_TEST_RESULT_CONNSTR }}"
+#        uses: ./.github/actions/run-python-test-set
+#        with:
+#          build_type: ${{ matrix.build_type }}
+#          rust_toolchain: ${{ matrix.rust_toolchain }}
+#          track_coverage: false
+#          test_selection: batch_pg_regress
+#
+#  python-other-tests:
+#    # FIXME: disable the other tests suite for macOs: it's able to run up to ~94% now,
+#    # but one of the tests hangs and never completes, thus failing the job on a timeout
+#    if: ${{ 'one' == 'two' }}
+#    needs: build-zenith
+#    strategy:
+#      matrix:
+#        build_type: [debug, release]
+#        rust_toolchain: [1.56]
+#    timeout-minutes: 40
+#    name: run python other tests suite (macOs)
+#    runs-on: macos-latest
+#
+#    steps:
+#      - name: Checkout
+#        uses: actions/checkout@v3
+#
+#      - name: Pytest other tests
+#        uses: ./.github/actions/run-python-test-set
+#        with:
+#          build_type: ${{ matrix.build_type }}
+#          rust_toolchain: ${{ matrix.rust_toolchain }}
+#          track_coverage: false
+#          test_selection: batch_others
+#
+#  python-performance-tests:
+#    needs: build-zenith
+#    strategy:
+#      matrix:
+#        build_type: [release]
+#        rust_toolchain: [1.56]
+#    timeout-minutes: 40
+#    name: run python performance tests suite (macOs)
+#    runs-on: macos-latest
+#
+#    steps:
+#      - name: Checkout
+#        uses: actions/checkout@v3
+#
+#      - name: Pytest performance tests
+#        env:
+#          PERF_TEST_RESULT_CONNSTR: "${{ secrets.PERF_TEST_RESULT_CONNSTR }}"
+#        uses: ./.github/actions/run-python-test-set
+#        with:
+#          build_type: ${{ matrix.build_type }}
+#          rust_toolchain: ${{ matrix.rust_toolchain }}
+#          save_perf_report: true
+#          run_in_parallel: false
+#          test_selection: performance
