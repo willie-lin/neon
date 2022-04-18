@@ -30,8 +30,8 @@ const_format = "0.2.21"
 tokio-postgres = { git = "https://github.com/zenithdb/rust-postgres.git", rev="2949d98df52587d562986aad155dd4e889e408b7" }
 etcd-client = "0.8.3"
 tokio-util = { version = "0.7", features = ["io"] }
-rusoto_core = "0.47"
-rusoto_s3 = "0.47"
+aws-config = "0.10.1"
+aws-sdk-s3 = "0.10.1"
 
 postgres_ffi = { path = "../postgres_ffi" }
 zenith_metrics = { path = "../zenith_metrics" }

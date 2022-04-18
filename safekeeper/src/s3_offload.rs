@@ -3,18 +3,17 @@
 //
 
 use anyhow::Context;
+use aws_sdk_s3::types::ByteStream;
+use aws_sdk_s3::{config, Client, Credentials, Endpoint, Region};
 use postgres_ffi::xlog_utils::*;
-use rusoto_core::credential::StaticProvider;
-use rusoto_core::{HttpClient, Region};
-use rusoto_s3::{ListObjectsV2Request, PutObjectRequest, S3Client, StreamingBody, S3};
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::env;
 use std::path::Path;
 use std::time::SystemTime;
-use tokio::fs::{self, File};
+use tokio::fs;
 use tokio::runtime;
 use tokio::time::sleep;
-use tokio_util::io::ReaderStream;
 use tracing::*;
 use walkdir::WalkDir;
 
@@ -39,7 +38,7 @@ pub fn thread_main(conf: SafeKeeperConf) {
 }
 
 async fn offload_files(
-    client: &S3Client,
+    client: &Client,
     bucket_name: &str,
     listing: &HashSet<String>,
     dir_path: &Path,
@@ -58,14 +57,12 @@ async fn offload_files(
             let relpath = path.strip_prefix(&conf.workdir).unwrap();
             let s3path = String::from("walarchive/") + relpath.to_str().unwrap();
             if !listing.contains(&s3path) {
-                let file = File::open(&path).await?;
                 client
-                    .put_object(PutObjectRequest {
-                        body: Some(StreamingBody::new(ReaderStream::new(file))),
-                        bucket: bucket_name.to_string(),
-                        key: s3path,
-                        ..PutObjectRequest::default()
-                    })
+                    .put_object()
+                    .bucket(bucket_name)
+                    .key(&s3path)
+                    .body(ByteStream::from_path(&path).await?)
+                    .send()
                     .await?;
 
                 fs::remove_file(&path).await?;
@@ -77,21 +74,25 @@ async fn offload_files(
 }
 
 async fn main_loop(conf: &SafeKeeperConf) -> anyhow::Result<()> {
-    let region = Region::Custom {
-        name: env::var("S3_REGION").context("S3_REGION env var is not set")?,
-        endpoint: env::var("S3_ENDPOINT").context("S3_ENDPOINT env var is not set")?,
-    };
+    let s3_region = env::var("S3_REGION").context("S3_REGION env var is not set")?;
+    let s3_endpoint = env::var("S3_ENDPOINT").context("S3_ENDPOINT env var is not set")?;
+    let bucket_name = "zenith-testbucket";
 
-    let client = S3Client::new_with(
-        HttpClient::new().context("Failed to create S3 http client")?,
-        StaticProvider::new_minimal(
+    let config = config::Builder::new()
+        .region(Region::new(Cow::Owned(s3_region)))
+        .endpoint_resolver(Endpoint::immutable(s3_endpoint.parse().with_context(
+            || format!("Failed to parse endpoint '{}' as url", s3_endpoint),
+        )?))
+        .credentials_provider(Credentials::new(
             env::var("S3_ACCESSKEY").context("S3_ACCESSKEY env var is not set")?,
             env::var("S3_SECRET").context("S3_SECRET env var is not set")?,
-        ),
-        region,
-    );
+            None,
+            None,
+            "safekeeper static credentials",
+        ))
+        .build();
 
-    let bucket_name = "zenith-testbucket";
+    let client = Client::from_conf(config);
 
     loop {
         let listing = gather_wal_entries(&client, bucket_name).await?;
@@ -101,22 +102,20 @@ async fn main_loop(conf: &SafeKeeperConf) -> anyhow::Result<()> {
     }
 }
 
-async fn gather_wal_entries(
-    client: &S3Client,
-    bucket_name: &str,
-) -> anyhow::Result<HashSet<String>> {
+async fn gather_wal_entries(client: &Client, bucket_name: &str) -> anyhow::Result<HashSet<String>> {
     let mut document_keys = HashSet::new();
 
     let mut continuation_token = None::<String>;
     loop {
-        let response = client
-            .list_objects_v2(ListObjectsV2Request {
-                bucket: bucket_name.to_string(),
-                prefix: Some("walarchive/".to_string()),
-                continuation_token,
-                ..ListObjectsV2Request::default()
-            })
-            .await?;
+        let mut request = client
+            .list_objects_v2()
+            .bucket(bucket_name)
+            .prefix("walarchive/");
+        if let Some(token) = &continuation_token {
+            request = request.continuation_token(token);
+        }
+
+        let response = request.send().await?;
         document_keys.extend(
             response
                 .contents

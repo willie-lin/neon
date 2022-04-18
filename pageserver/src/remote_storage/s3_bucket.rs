@@ -1,21 +1,19 @@
-//! AWS S3 storage wrapper around `rusoto` library.
+//! AWS S3 storage wrapper around `aws-sdk-s3` library.
 //!
 //! Respects `prefix_in_bucket` property from [`S3Config`],
 //! allowing multiple pageservers to independently work with the same S3 bucket, if
 //! their bucket prefixes are both specified and different.
 
-use std::path::{Path, PathBuf};
+use std::{
+    borrow::Cow,
+    path::{Path, PathBuf},
+};
 
 use anyhow::Context;
-use rusoto_core::{
-    credential::{InstanceMetadataProvider, StaticProvider},
-    HttpClient, Region,
-};
-use rusoto_s3::{
-    DeleteObjectRequest, GetObjectRequest, ListObjectsV2Request, PutObjectRequest, S3Client,
-    StreamingBody, S3,
-};
-use tokio::io;
+use aws_config::ecs::EcsCredentialsProvider;
+use aws_sdk_s3::{config, types::ByteStream, Client, Credentials, Endpoint, Region};
+use tokio::io::{self, AsyncWriteExt};
+use tokio_stream::StreamExt;
 use tokio_util::io::ReaderStream;
 use tracing::{debug, trace};
 
@@ -62,7 +60,7 @@ impl S3ObjectKey {
 /// AWS S3 storage.
 pub struct S3Bucket {
     pageserver_workdir: &'static Path,
-    client: S3Client,
+    client: Client,
     bucket_name: String,
     prefix_in_bucket: Option<String>,
 }
@@ -78,32 +76,31 @@ impl S3Bucket {
             "Creating s3 remote storage for S3 bucket {}",
             aws_config.bucket_name
         );
-        let region = match aws_config.endpoint.clone() {
-            Some(custom_endpoint) => Region::Custom {
-                name: aws_config.bucket_region.clone(),
-                endpoint: custom_endpoint,
-            },
-            None => aws_config
-                .bucket_region
-                .parse::<Region>()
-                .context("Failed to parse the s3 region from config")?,
-        };
-        let request_dispatcher = HttpClient::new().context("Failed to create S3 http client")?;
-        let client = if aws_config.access_key_id.is_none() && aws_config.secret_access_key.is_none()
-        {
+        let mut config_builder = config::Builder::new()
+            .region(Region::new(Cow::Owned(aws_config.bucket_region.clone())));
+
+        if let Some(custom_endpoint) = &aws_config.endpoint {
+            config_builder = config_builder.endpoint_resolver(Endpoint::immutable(
+                custom_endpoint.parse().with_context(|| {
+                    format!("Failed to parse endpoint '{}' as url", custom_endpoint)
+                })?,
+            ));
+        }
+        if aws_config.access_key_id.is_none() && aws_config.secret_access_key.is_none() {
             trace!("Using IAM-based AWS access");
-            S3Client::new_with(request_dispatcher, InstanceMetadataProvider::new(), region)
+            config_builder =
+                config_builder.credentials_provider(EcsCredentialsProvider::builder().build());
         } else {
             trace!("Using credentials-based AWS access");
-            S3Client::new_with(
-                request_dispatcher,
-                StaticProvider::new_minimal(
-                    aws_config.access_key_id.clone().unwrap_or_default(),
-                    aws_config.secret_access_key.clone().unwrap_or_default(),
-                ),
-                region,
-            )
-        };
+            config_builder = config_builder.credentials_provider(Credentials::new(
+                aws_config.access_key_id.as_deref().unwrap_or_default(),
+                aws_config.secret_access_key.as_deref().unwrap_or_default(),
+                None,
+                None,
+                "pageserver static credentials",
+            ));
+        }
+        let client = Client::from_conf(config_builder.build());
 
         let prefix_in_bucket = aws_config.prefix_in_bucket.as_deref().map(|prefix| {
             let mut prefix = prefix;
@@ -151,26 +148,26 @@ impl RemoteStorage for S3Bucket {
 
         let mut continuation_token = None;
         loop {
-            let fetch_response = self
-                .client
-                .list_objects_v2(ListObjectsV2Request {
-                    bucket: self.bucket_name.clone(),
-                    prefix: self.prefix_in_bucket.clone(),
-                    continuation_token,
-                    ..ListObjectsV2Request::default()
-                })
-                .await?;
+            let mut request = self.client.list_objects_v2().bucket(&self.bucket_name);
+            if let Some(prefix) = &self.prefix_in_bucket {
+                request = request.prefix(prefix);
+            }
+            if let Some(token) = &continuation_token {
+                request = request.continuation_token(token);
+            }
+
+            let response = request.send().await?;
             document_keys.extend(
-                fetch_response
+                response
                     .contents
                     .unwrap_or_default()
                     .into_iter()
                     .filter_map(|o| Some(S3ObjectKey(o.key?))),
             );
 
-            match fetch_response.continuation_token {
-                Some(new_token) => continuation_token = Some(new_token),
-                None => break,
+            continuation_token = response.continuation_token;
+            if continuation_token.is_none() {
+                break;
             }
         }
 
@@ -184,13 +181,14 @@ impl RemoteStorage for S3Bucket {
         metadata: Option<StorageMetadata>,
     ) -> anyhow::Result<()> {
         self.client
-            .put_object(PutObjectRequest {
-                body: Some(StreamingBody::new(ReaderStream::new(from))),
-                bucket: self.bucket_name.clone(),
-                key: to.key().to_owned(),
-                metadata: metadata.map(|m| m.0),
-                ..PutObjectRequest::default()
-            })
+            .put_object()
+            .bucket(&self.bucket_name)
+            .key(to.key())
+            .body(ByteStream::from(hyper::Body::wrap_stream(
+                ReaderStream::new(from),
+            )))
+            .set_metadata(metadata.map(|m| m.0))
+            .send()
             .await?;
         Ok(())
     }
@@ -202,16 +200,15 @@ impl RemoteStorage for S3Bucket {
     ) -> anyhow::Result<Option<StorageMetadata>> {
         let object_output = self
             .client
-            .get_object(GetObjectRequest {
-                bucket: self.bucket_name.clone(),
-                key: from.key().to_owned(),
-                ..GetObjectRequest::default()
-            })
+            .get_object()
+            .bucket(&self.bucket_name)
+            .key(from.key())
+            .send()
             .await?;
 
-        if let Some(body) = object_output.body {
-            let mut from = io::BufReader::new(body.into_async_read());
-            io::copy(&mut from, to).await?;
+        let mut body = object_output.body;
+        while let Some(bytes) = body.try_next().await? {
+            to.write_all(&bytes).await?;
         }
 
         Ok(object_output.metadata.map(StorageMetadata))
@@ -231,19 +228,19 @@ impl RemoteStorage for S3Bucket {
             Some(end_inclusive) => format!("bytes={}-{}", start_inclusive, end_inclusive),
             None => format!("bytes={}-", start_inclusive),
         });
-        let object_output = self
+        let mut request = self
             .client
-            .get_object(GetObjectRequest {
-                bucket: self.bucket_name.clone(),
-                key: from.key().to_owned(),
-                range,
-                ..GetObjectRequest::default()
-            })
-            .await?;
+            .get_object()
+            .bucket(&self.bucket_name)
+            .key(from.key());
+        if let Some(range) = range {
+            request = request.range(range);
+        }
+        let object_output = request.send().await?;
 
-        if let Some(body) = object_output.body {
-            let mut from = io::BufReader::new(body.into_async_read());
-            io::copy(&mut from, to).await?;
+        let mut body = object_output.body;
+        while let Some(bytes) = body.try_next().await? {
+            to.write_all(&bytes).await?;
         }
 
         Ok(object_output.metadata.map(StorageMetadata))
@@ -251,11 +248,10 @@ impl RemoteStorage for S3Bucket {
 
     async fn delete(&self, path: &Self::StoragePath) -> anyhow::Result<()> {
         self.client
-            .delete_object(DeleteObjectRequest {
-                bucket: self.bucket_name.clone(),
-                key: path.key().to_owned(),
-                ..DeleteObjectRequest::default()
-            })
+            .delete_object()
+            .bucket(&self.bucket_name)
+            .key(path.key())
+            .send()
             .await?;
         Ok(())
     }
@@ -430,7 +426,7 @@ mod tests {
     fn dummy_storage(pageserver_workdir: &'static Path) -> S3Bucket {
         S3Bucket {
             pageserver_workdir,
-            client: S3Client::new("us-east-1".parse().unwrap()),
+            client: Client::new(&aws_types::SdkConfig::builder().build()),
             bucket_name: "dummy-bucket".to_string(),
             prefix_in_bucket: Some("dummy_prefix/".to_string()),
         }
