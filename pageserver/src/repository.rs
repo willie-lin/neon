@@ -7,6 +7,7 @@ use byteorder::{ByteOrder, BE};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::fmt::Debug;
 use std::fmt::Display;
 use std::ops::{AddAssign, Range};
 use std::sync::{Arc, RwLockReadGuard};
@@ -16,7 +17,7 @@ use utils::{
     zid::ZTimelineId,
 };
 
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, Ord, PartialOrd, Serialize, Deserialize)]
+#[derive(Clone, Copy, Hash, PartialEq, Eq, Ord, PartialOrd, Serialize, Deserialize)]
 /// Key used in the Repository kv-store.
 ///
 /// The Repository treates this as an opaque struct, but see the code in pgdatadir_mapping.rs
@@ -115,6 +116,16 @@ pub fn singleton_range(key: Key) -> Range<Key> {
 }
 
 impl fmt::Display for Key {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{:02X}{:08X}{:08X}{:08X}{:02X}{:08X}",
+            self.field1, self.field2, self.field3, self.field4, self.field5, self.field6
+        )
+    }
+}
+
+impl fmt::Debug for Key {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
