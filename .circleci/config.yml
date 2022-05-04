@@ -445,7 +445,7 @@ jobs:
               --build-arg GIT_VERSION=${CIRCLE_SHA1} \
               --build-arg AWS_ACCESS_KEY_ID="${CACHEPOT_AWS_ACCESS_KEY_ID}" \
               --build-arg AWS_SECRET_ACCESS_KEY="${CACHEPOT_AWS_SECRET_ACCESS_KEY}" \
-              --tag neondatabase/neon:${DOCKER_TAG} --tag neondatabase/neon:latest .
+              --tag neondatabase/neon:${DOCKER_TAG} --tag .
             docker push neondatabase/neon:${DOCKER_TAG}
             #docker push neondatabase/neon:latest
 
