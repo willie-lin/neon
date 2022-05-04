@@ -116,6 +116,7 @@ jobs:
               CARGO_FLAGS="--release --features profiling"
             fi
 
+            export GIT_VERSION=${CIRCLE_SHA1}
             export CARGO_INCREMENTAL=0
             export CACHEPOT_BUCKET=zenith-rust-cachepot
             export RUSTC_WRAPPER=cachepot
@@ -445,8 +446,8 @@ jobs:
               --build-arg AWS_ACCESS_KEY_ID="${CACHEPOT_AWS_ACCESS_KEY_ID}" \
               --build-arg AWS_SECRET_ACCESS_KEY="${CACHEPOT_AWS_SECRET_ACCESS_KEY}" \
               --tag neondatabase/neon:${DOCKER_TAG} --tag neondatabase/neon:latest .
-            docker push neondatabase/neon:${DOCKER_TAG}
-            docker push neondatabase/neon:latest
+            docker push neondatabase/neon:test-${DOCKER_TAG}
+            #docker push neondatabase/neon:latest
 
   # Build neondatabase/compute-node:latest image and push it to Docker hub
   docker-image-compute:
@@ -737,7 +738,7 @@ workflows:
           filters:
             branches:
               only:
-                - main
+                - fix_version
           requires:
             - pg_regress-tests-release
             - other-tests-release
