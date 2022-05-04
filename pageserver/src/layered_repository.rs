@@ -1844,11 +1844,12 @@ impl LayeredTimeline {
                 }
             }
             if self.upload_layers.load(atomic::Ordering::Relaxed) {
+                let _metadata = load_metadata(self.conf, self.timelineid, self.tenantid)?;
                 remote_storage::schedule_layer_upload(
                     self.tenantid,
                     self.timelineid,
                     layer_paths_to_upload,
-                    None,
+                    Some(_metadata),
                 );
             }
             timer.stop_and_record();
@@ -2043,11 +2044,12 @@ impl LayeredTimeline {
         drop(layers);
 
         if self.upload_layers.load(atomic::Ordering::Relaxed) {
+            let _metadata = load_metadata(self.conf, self.timelineid, self.tenantid)?;
             remote_storage::schedule_layer_upload(
                 self.tenantid,
                 self.timelineid,
                 new_layer_paths,
-                None,
+                Some(_metadata),
             );
             remote_storage::schedule_layer_delete(
                 self.tenantid,
