@@ -439,14 +439,14 @@ jobs:
           name: Build and push Docker image
           command: |
             echo $NEON_DOCKER_PWD | docker login -u $NEON_DOCKER_LOGIN --password-stdin
-            DOCKER_TAG=$(git log --oneline|wc -l)
+            DOCKER_TAG=test-$(git log --oneline|wc -l)
             docker build \
               --pull \
               --build-arg GIT_VERSION=${CIRCLE_SHA1} \
               --build-arg AWS_ACCESS_KEY_ID="${CACHEPOT_AWS_ACCESS_KEY_ID}" \
               --build-arg AWS_SECRET_ACCESS_KEY="${CACHEPOT_AWS_SECRET_ACCESS_KEY}" \
               --tag neondatabase/neon:${DOCKER_TAG} --tag neondatabase/neon:latest .
-            docker push neondatabase/neon:test-${DOCKER_TAG}
+            docker push neondatabase/neon:${DOCKER_TAG}
             #docker push neondatabase/neon:latest
 
   # Build neondatabase/compute-node:latest image and push it to Docker hub
