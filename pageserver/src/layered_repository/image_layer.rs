@@ -125,10 +125,6 @@ impl Layer for ImageLayer {
         PathBuf::from(self.layer_name().to_string())
     }
 
-    fn local_path(&self) -> Option<PathBuf> {
-        Some(self.path())
-    }
-
     fn get_tenant_id(&self) -> ZTenantId {
         self.tenantid
     }

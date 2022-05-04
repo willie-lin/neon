@@ -14,7 +14,6 @@
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use bytes::Bytes;
 use fail::fail_point;
-use itertools::Itertools;
 use lazy_static::lazy_static;
 use tracing::*;
 
@@ -1282,7 +1281,7 @@ impl LayeredTimeline {
                     ImageLayer::new(self.conf, self.timelineid, self.tenantid, &imgfilename);
 
                 trace!("found layer {}", layer.filename().display());
-                layers.insert_historic(Arc::new(layer));
+                layers.insert_historic(layer);
                 num_layers += 1;
             } else if let Some(deltafilename) = DeltaFileName::parse_str(&fname) {
                 // Create a DeltaLayer struct for each delta file.
@@ -1305,7 +1304,7 @@ impl LayeredTimeline {
                     DeltaLayer::new(self.conf, self.timelineid, self.tenantid, &deltafilename);
 
                 trace!("found layer {}", layer.filename().display());
-                layers.insert_historic(Arc::new(layer));
+                layers.insert_historic(layer);
                 num_layers += 1;
             } else if fname == METADATA_FILE_NAME || fname.ends_with(".old") {
                 // ignore these
@@ -1346,7 +1345,7 @@ impl LayeredTimeline {
         let mut timeline_owned;
         let mut timeline = self;
 
-        let mut path: Vec<(ValueReconstructResult, Lsn, Arc<dyn Layer>)> = Vec::new();
+        let mut path: Vec<(ValueReconstructResult, Lsn, PathBuf)> = Vec::new();
 
         let cached_lsn = if let Some((cached_lsn, _)) = &reconstruct_state.img {
             *cached_lsn
@@ -1379,38 +1378,27 @@ impl LayeredTimeline {
 
                         // For debugging purposes, print the path of layers that we traversed
                         // through.
-                        for (r, c, l) in path {
+                        for (r, c, filename) in path {
                             error!(
-                                "PATH: result {:?}, cont_lsn {}, layer: {}",
-                                r,
-                                c,
-                                l.filename().display()
+                                "PATH: result {r:?}, cont_lsn {c}, layer: {}",
+                                filename.display()
                             );
                         }
-                        bail!("could not find layer with more data for key {} at LSN {}, request LSN {}, ancestor {}",
-                          key,
-                          Lsn(cont_lsn.0 - 1),
-                              request_lsn,
-                        timeline.ancestor_lsn)
+                        bail!("could not find layer with more data for key {key} at LSN {}, request LSN {request_lsn}, ancestor {}",
+                            Lsn(cont_lsn.0 - 1), timeline.ancestor_lsn)
                     }
                     prev_lsn = cont_lsn;
                 }
                 ValueReconstructResult::Missing => {
-                    bail!(
-                        "could not find data for key {} at LSN {}, for request at LSN {}",
-                        key,
-                        cont_lsn,
-                        request_lsn
-                    )
+                    bail!("could not find data for key {key} at LSN {cont_lsn}, for request at LSN {request_lsn}")
                 }
             }
 
             // Recurse into ancestor if needed
             if Lsn(cont_lsn.0 - 1) <= timeline.ancestor_lsn {
                 trace!(
-                    "going into ancestor {}, cont_lsn is {}",
+                    "going into ancestor {}, cont_lsn is {cont_lsn}",
                     timeline.ancestor_lsn,
-                    cont_lsn
                 );
                 let ancestor = timeline.get_ancestor_timeline()?;
                 timeline_owned = ancestor;
@@ -1436,7 +1424,7 @@ impl LayeredTimeline {
                         reconstruct_state,
                     )?;
                     cont_lsn = lsn_floor;
-                    path.push((result, cont_lsn, open_layer.clone()));
+                    path.push((result, cont_lsn, open_layer.filename()));
                     continue;
                 }
             }
@@ -1451,7 +1439,7 @@ impl LayeredTimeline {
                         reconstruct_state,
                     )?;
                     cont_lsn = lsn_floor;
-                    path.push((result, cont_lsn, frozen_layer.clone()));
+                    path.push((result, cont_lsn, frozen_layer.filename()));
                     continue 'outer;
                 }
             }
@@ -1466,7 +1454,7 @@ impl LayeredTimeline {
                     reconstruct_state,
                 )?;
                 cont_lsn = lsn_floor;
-                path.push((result, cont_lsn, layer));
+                path.push((result, cont_lsn, layer.filename()));
             } else if timeline.ancestor_timeline.is_some() {
                 // Nothing on this timeline. Traverse to parent
                 result = ValueReconstructResult::Continue;
@@ -1707,7 +1695,7 @@ impl LayeredTimeline {
             assert!(Arc::ptr_eq(&l.unwrap(), &frozen_layer));
 
             // Add the new delta layer to the LayerMap
-            layers.insert_historic(Arc::new(new_delta));
+            layers.insert_historic(new_delta);
 
             // release lock on 'layers'
         }
@@ -1871,7 +1859,7 @@ impl LayeredTimeline {
         for part_range in &partition.ranges {
             let image_coverage = layers.image_coverage(part_range, lsn)?;
             for (img_range, last_img) in image_coverage {
-                let img_lsn = if let Some(ref last_img) = last_img {
+                let img_lsn = if let Some(last_img) = last_img {
                     last_img.get_lsn_range().end
                 } else {
                     Lsn(0)
@@ -1926,7 +1914,7 @@ impl LayeredTimeline {
 
         let mut layers = self.layers.write().unwrap();
         let new_path = image_layer.path();
-        layers.insert_historic(Arc::new(image_layer));
+        layers.insert_historic(image_layer);
         drop(layers);
 
         Ok(new_path)
@@ -1942,31 +1930,46 @@ impl LayeredTimeline {
         if level0_deltas.len() < self.get_compaction_threshold() {
             return Ok(());
         }
+
+        let mut lsn_range = None::<Range<Lsn>>;
+        let mut all_values_vec: Vec<anyhow::Result<(Key, Lsn, Value)>> = Vec::new();
+        let mut level0_delta_files_to_remove = HashSet::with_capacity(level0_deltas.len());
+
+        for l in level0_deltas {
+            // FIXME: this function probably won't work correctly if there's overlap
+            // in the deltas.
+            lsn_range = match lsn_range {
+                Some(old_range) => {
+                    let new_range = l.get_lsn_range();
+                    Some(min(old_range.start, new_range.start)..max(old_range.end, new_range.end))
+                }
+                None => Some(l.get_lsn_range()),
+            };
+
+            all_values_vec.extend(l.iter());
+            level0_delta_files_to_remove.insert(l.path());
+        }
+
         drop(layers);
 
-        // FIXME: this function probably won't work correctly if there's overlap
-        // in the deltas.
-        let lsn_range = level0_deltas
-            .iter()
-            .map(|l| l.get_lsn_range())
-            .reduce(|a, b| min(a.start, b.start)..max(a.end, b.end))
-            .unwrap();
-
-        let all_values_iter = level0_deltas.iter().map(|l| l.iter()).kmerge_by(|a, b| {
+        all_values_vec.sort_by(|a, b| {
             if let Ok((a_key, a_lsn, _)) = a {
                 if let Ok((b_key, b_lsn, _)) = b {
                     match a_key.cmp(b_key) {
-                        Ordering::Less => true,
-                        Ordering::Equal => a_lsn <= b_lsn,
-                        Ordering::Greater => false,
+                        cmp @ (Ordering::Less | Ordering::Greater) => cmp,
+                        Ordering::Equal => a_lsn.cmp(b_lsn),
                     }
                 } else {
-                    false
+                    Ordering::Greater
                 }
             } else {
-                true
+                Ordering::Less
             }
         });
+        let lsn_range = match lsn_range {
+            Some(lsn_range) => lsn_range,
+            None => bail!("Failed to find at least one Lsn range in level0 deltas"),
+        };
 
         // Merge the contents of all the input delta layers into a new set
         // of delta layers, based on the current partitioning.
@@ -1979,7 +1982,7 @@ impl LayeredTimeline {
         let mut new_layers = Vec::new();
         let mut prev_key: Option<Key> = None;
         let mut writer: Option<DeltaLayerWriter> = None;
-        for x in all_values_iter {
+        for x in all_values_vec {
             let (key, lsn, value) = x?;
 
             if let Some(prev_key) = prev_key {
@@ -2027,18 +2030,16 @@ impl LayeredTimeline {
         let mut new_layer_paths = HashSet::with_capacity(new_layers.len());
         for l in new_layers {
             new_layer_paths.insert(l.path());
-            layers.insert_historic(Arc::new(l));
+            layers.insert_historic(l);
         }
 
         // Now that we have reshuffled the data to set of new delta layers, we can
         // delete the old ones
-        let mut layer_paths_do_delete = HashSet::with_capacity(level0_deltas.len());
-        for l in level0_deltas {
+        let removed_layers = layers.remove_historic_layers(level0_delta_files_to_remove);
+        let mut layer_paths_do_delete = HashSet::with_capacity(removed_layers.len());
+        for l in removed_layers {
             l.delete()?;
-            if let Some(path) = l.local_path() {
-                layer_paths_do_delete.insert(path);
-            }
-            layers.remove_historic(l);
+            layer_paths_do_delete.insert(l.path());
         }
         drop(layers);
 
@@ -2118,7 +2119,7 @@ impl LayeredTimeline {
 
         debug!("retain_lsns: {:?}", retain_lsns);
 
-        let mut layers_to_remove = Vec::new();
+        let mut layer_paths_to_remove = HashSet::new();
 
         // Scan all on-disk layers in the timeline.
         //
@@ -2223,19 +2224,16 @@ impl LayeredTimeline {
                 l.filename().display(),
                 l.is_incremental(),
             );
-            layers_to_remove.push(Arc::clone(l));
+            layer_paths_to_remove.insert(l.path());
         }
 
         // Actually delete the layers from disk and remove them from the map.
         // (couldn't do this in the loop above, because you cannot modify a collection
         // while iterating it. BTreeMap::retain() would be another option)
-        let mut layer_paths_to_delete = HashSet::with_capacity(layers_to_remove.len());
-        for doomed_layer in layers_to_remove {
+        let mut layer_paths_to_delete = HashSet::with_capacity(layer_paths_to_remove.len());
+        for doomed_layer in layers.remove_historic_layers(layer_paths_to_remove) {
+            layer_paths_to_delete.insert(doomed_layer.path());
             doomed_layer.delete()?;
-            if let Some(path) = doomed_layer.local_path() {
-                layer_paths_to_delete.insert(path);
-            }
-            layers.remove_historic(doomed_layer);
             result.layers_removed += 1;
         }
 
