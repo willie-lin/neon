@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import field
+from sys import prefix
 import textwrap
 from cached_property import cached_property
 import asyncpg
@@ -265,10 +266,8 @@ def default_broker(request: Any, port_distributor: PortDistributor):
 
 
 @pytest.fixture(scope='session')
-def mock_s3_server(port_distributor: PortDistributor):
-    mock_s3_server = MockS3Server(port_distributor.get_port())
-    yield mock_s3_server
-    mock_s3_server.kill()
+def run_id():
+    yield uuid.uuid4()
 
 
 class PgProtocol:
@@ -380,48 +379,6 @@ class AuthKeys:
         return token
 
 
-class MockS3Server:
-    """
-    Starts a mock S3 server for testing on a port given, errors if the server fails to start or exits prematurely.
-    Relies that `poetry` and `moto` server are installed, since it's the way the tests are run.
-
-    Also provides a set of methods to derive the connection properties from and the method to kill the underlying server.
-    """
-    def __init__(
-        self,
-        port: int,
-    ):
-        self.port = port
-
-        self.subprocess = subprocess.Popen([f'poetry run moto_server s3 -p{port}'], shell=True)
-        error = None
-        try:
-            return_code = self.subprocess.poll()
-            if return_code is not None:
-                error = f"expected mock s3 server to run but it exited with code {return_code}. stdout: '{self.subprocess.stdout}', stderr: '{self.subprocess.stderr}'"
-        except Exception as e:
-            error = f"expected mock s3 server to start but it failed with exception: {e}. stdout: '{self.subprocess.stdout}', stderr: '{self.subprocess.stderr}'"
-        if error is not None:
-            log.error(error)
-            self.subprocess.kill()
-            raise RuntimeError("failed to start s3 mock server")
-
-    def endpoint(self) -> str:
-        return f"http://127.0.0.1:{self.port}"
-
-    def region(self) -> str:
-        return 'us-east-1'
-
-    def access_key(self) -> str:
-        return 'test'
-
-    def secret_key(self) -> str:
-        return 'test'
-
-    def kill(self):
-        self.subprocess.kill()
-
-
 class ZenithEnvBuilder:
     """
     Builder object to create a Zenith runtime environment
@@ -435,7 +392,7 @@ class ZenithEnvBuilder:
                  repo_dir: Path,
                  port_distributor: PortDistributor,
                  broker: Etcd,
-                 mock_s3_server: MockS3Server,
+                 run_id: uuid.UUID,
                  remote_storage: Optional[RemoteStorage] = None,
                  pageserver_config_override: Optional[str] = None,
                  num_safekeepers: int = 1,
@@ -447,12 +404,13 @@ class ZenithEnvBuilder:
         self.port_distributor = port_distributor
         self.remote_storage = remote_storage
         self.broker = broker
-        self.mock_s3_server = mock_s3_server
+        self.run_id = run_id
         self.pageserver_config_override = pageserver_config_override
         self.num_safekeepers = num_safekeepers
         self.pageserver_auth_enabled = pageserver_auth_enabled
         self.default_branch_name = default_branch_name
         self.env: Optional[ZenithEnv] = None
+        self.remote_storage_prefix = None
 
     def init(self) -> ZenithEnv:
         # Cannot create more than one environment from one builder
@@ -483,20 +441,68 @@ class ZenithEnvBuilder:
     Errors, if the pageserver has some remote storage configuration already, unless `force_enable` is not set to `True`.
     """
 
-    def enable_s3_mock_remote_storage(self, bucket_name: str, force_enable=True):
+    def enable_s3_remote_storage(self, test_name: str, force_enable=True):
         assert force_enable or self.remote_storage is None, "remote storage is enabled already"
-        mock_endpoint = self.mock_s3_server.endpoint()
-        mock_region = self.mock_s3_server.region()
-        boto3.client(
+
+        access_key = os.getenv("AWS_ACCESS_KEY_ID")
+        assert access_key, "no aws access key provided"
+        secret_key = os.getenv("AWS_SECRET_ACCESS_KEY")
+        assert secret_key, "no aws access key provided"
+        bucket_name = os.getenv("REMOTE_STORAGE_S3_BUCKET")
+        assert bucket_name, "no remote storage bucket name provided"
+        region = os.getenv("REMOTE_STORAGE_S3_REGION")
+        assert region, "no remote storage region provided"
+
+        # construct a prefix inside bucket for the particular test case and test run
+        self.remote_storage_prefix = f'{self.run_id}/{test_name}'
+
+        self.remote_storage_client = boto3.client(
             's3',
-            endpoint_url=mock_endpoint,
-            region_name=mock_region,
-            aws_access_key_id=self.mock_s3_server.access_key(),
-            aws_secret_access_key=self.mock_s3_server.secret_key(),
-        ).create_bucket(Bucket=bucket_name)
+            region_name=region,
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+        )
         self.remote_storage = S3Storage(bucket=bucket_name,
-                                        endpoint=mock_endpoint,
-                                        region=mock_region)
+                                        region=region,
+                                        access_key=access_key,
+                                        secret_key=secret_key,
+                                        prefix_in_bucket=self.remote_storage_prefix)
+
+    def cleanup_remote_storage(self):
+        # here wee check for true remote storage, no the local one
+        # local cleanup is not needed after test because in ci all env will be destroyed anyway
+        if self.remote_storage_prefix is None:
+            log.info("no remote storage was set up, skipping cleanup")
+            return
+        log.info("removing data from test s3 bucket %s by prefix %s",
+                 self.remote_storage.bucket,
+                 self.remote_storage_prefix)
+        paginator = self.remote_storage_client.get_paginator('list_objects_v2')
+        pages = paginator.paginate(Bucket=self.remote_storage.bucket,
+                                   Prefix=self.remote_storage_prefix)
+
+        objects_to_delete = {'Objects': []}
+        cnt = 0
+        for item in pages.search('Contents'):
+            # weirdly when nothing is found it returns [None] when nothing ffound
+            if item is None:
+                break
+
+            objects_to_delete['Objects'].append({'Key': item['Key']})
+
+            # flush once aws limit reached
+            if len(objects_to_delete['Objects']) >= 1000:
+                self.remote_storage_client.delete_objects(Bucket=self.remote_storage.bucket,
+                                                          Delete=objects_to_delete)
+                objects_to_delete = dict(Objects=[])
+                cnt += 1
+
+        # flush rest
+        if len(objects_to_delete['Objects']):
+            self.remote_storage_client.delete_objects(Bucket=self.remote_storage.bucket_name,
+                                                      Delete=objects_to_delete)
+
+        log.info("deleted %s objects from remote storage", cnt)
 
     def __enter__(self):
         return self
@@ -510,6 +516,8 @@ class ZenithEnvBuilder:
             for sk in self.env.safekeepers:
                 sk.stop(immediate=True)
             self.env.pageserver.stop(immediate=True)
+
+            self.cleanup_remote_storage()
 
 
 class ZenithEnv:
@@ -548,7 +556,6 @@ class ZenithEnv:
         self.repo_dir = config.repo_dir
         self.rust_log_override = config.rust_log_override
         self.port_distributor = config.port_distributor
-        self.s3_mock_server = config.mock_s3_server
         self.zenith_cli = ZenithCli(env=self)
         self.postgres = PostgresFactory(self)
         self.safekeepers: List[Safekeeper] = []
@@ -630,10 +637,12 @@ class ZenithEnv:
 
 
 @pytest.fixture(scope=shareable_scope)
-def _shared_simple_env(request: Any,
-                       port_distributor: PortDistributor,
-                       mock_s3_server: MockS3Server,
-                       default_broker: Etcd) -> Iterator[ZenithEnv]:
+def _shared_simple_env(
+    request: Any,
+    port_distributor: PortDistributor,
+    default_broker: Etcd,
+    run_id: uuid.UUID,
+) -> Iterator[ZenithEnv]:
     """
     Internal fixture backing the `zenith_simple_env` fixture. If TEST_SHARED_FIXTURES
     is set, this is shared by all tests using `zenith_simple_env`.
@@ -647,8 +656,12 @@ def _shared_simple_env(request: Any,
         repo_dir = os.path.join(str(top_output_dir), "shared_repo")
         shutil.rmtree(repo_dir, ignore_errors=True)
 
-    with ZenithEnvBuilder(Path(repo_dir), port_distributor, default_broker,
-                          mock_s3_server) as builder:
+    with ZenithEnvBuilder(
+            repo_dir=Path(repo_dir),
+            port_distributor=port_distributor,
+            broker=default_broker,
+            run_id=run_id,
+    ) as builder:
         env = builder.init_start()
 
         # For convenience in tests, create a branch from the freshly-initialized cluster.
@@ -673,10 +686,12 @@ def zenith_simple_env(_shared_simple_env: ZenithEnv) -> Iterator[ZenithEnv]:
 
 
 @pytest.fixture(scope='function')
-def zenith_env_builder(test_output_dir,
-                       port_distributor: PortDistributor,
-                       mock_s3_server: MockS3Server,
-                       default_broker: Etcd) -> Iterator[ZenithEnvBuilder]:
+def zenith_env_builder(
+    test_output_dir,
+    port_distributor: PortDistributor,
+    default_broker: Etcd,
+    run_id: uuid.UUID,
+) -> Iterator[ZenithEnvBuilder]:
     """
     Fixture to create a Zenith environment for test.
 
@@ -694,8 +709,12 @@ def zenith_env_builder(test_output_dir,
     repo_dir = os.path.join(test_output_dir, "repo")
 
     # Return the builder to the caller
-    with ZenithEnvBuilder(Path(repo_dir), port_distributor, default_broker,
-                          mock_s3_server) as builder:
+    with ZenithEnvBuilder(
+            repo_dir=Path(repo_dir),
+            port_distributor=port_distributor,
+            broker=default_broker,
+            run_id=run_id,
+    ) as builder:
         yield builder
 
 
@@ -828,7 +847,10 @@ class LocalFsStorage:
 class S3Storage:
     bucket: str
     region: str
-    endpoint: Optional[str]
+    access_key: str
+    secret_key: str
+    endpoint: Optional[str] = None
+    prefix_in_bucket: Optional[str] = None
 
 
 RemoteStorage = Union[LocalFsStorage, S3Storage]
@@ -848,7 +870,6 @@ class ZenithCli:
     """
     def __init__(self, env: ZenithEnv):
         self.env = env
-        pass
 
     def create_tenant(self,
                       tenant_id: Optional[uuid.UUID] = None,
@@ -1022,10 +1043,10 @@ class ZenithCli:
             pageserver_config_override=self.env.pageserver.config_override)
 
         s3_env_vars = None
-        if self.env.s3_mock_server:
+        if self.env.remote_storage is not None and isinstance(self.env.remote_storage, S3Storage):
             s3_env_vars = {
-                'AWS_ACCESS_KEY_ID': self.env.s3_mock_server.access_key(),
-                'AWS_SECRET_ACCESS_KEY': self.env.s3_mock_server.secret_key(),
+                'AWS_ACCESS_KEY_ID': self.env.remote_storage.access_key,
+                'AWS_SECRET_ACCESS_KEY': self.env.remote_storage.secret_key,
             }
         return self.raw_cli(start_args, extra_env_vars=s3_env_vars)
 
@@ -1171,8 +1192,10 @@ class ZenithCli:
             # this way command output will be in recorded and shown in CI in failure message
             msg = f"""\
             Run failed: {exc}
-              stdout: {exc.stdout}
-              stderr: {exc.stderr}
+              stdout: 
+                {exc.stdout}
+              stderr: 
+                {exc.stderr}
             """
             log.info(msg)
 
@@ -1222,7 +1245,7 @@ class ZenithPageserver(PgProtocol):
         return self
 
     def __exit__(self, exc_type, exc, tb):
-        self.stop(True)
+        self.stop(immediate=True)
 
     def http_client(self, auth_token: Optional[str] = None) -> ZenithPageserverHttpClient:
         return ZenithPageserverHttpClient(
@@ -1245,6 +1268,9 @@ def append_pageserver_param_overrides(
 
             if remote_storage.endpoint is not None:
                 pageserver_storage_override += f",endpoint='{remote_storage.endpoint}'"
+
+            if remote_storage.prefix_in_bucket is not None:
+                pageserver_storage_override += f",prefix_in_bucket='{remote_storage.prefix_in_bucket}'"
 
         else:
             raise Exception(f'Unknown storage configuration {remote_storage}')

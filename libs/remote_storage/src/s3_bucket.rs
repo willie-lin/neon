@@ -215,6 +215,9 @@ impl RemoteStorage for S3Bucket {
             .acquire()
             .await
             .context("Concurrency limiter semaphore got closed during S3 download")?;
+        
+        debug!("before get_object");
+
         let object_output = self
             .client
             .get_object(GetObjectRequest {
@@ -223,6 +226,8 @@ impl RemoteStorage for S3Bucket {
                 ..GetObjectRequest::default()
             })
             .await?;
+        
+        debug!("after get_object");
 
         if let Some(body) = object_output.body {
             let mut from = io::BufReader::new(body.into_async_read());

@@ -832,11 +832,13 @@ where
         .build()
         .context("Failed to create storage sync runtime")?;
 
+    debug!("before try_fetch_index_parts");
     let applicable_index_parts = runtime.block_on(try_fetch_index_parts(
         conf,
         &storage,
         local_timeline_files.keys().copied().collect(),
     ));
+    debug!("after try_fetch_index_parts");
 
     let remote_index = RemoteIndex::from_parts(conf, applicable_index_parts)?;
 

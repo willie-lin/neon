@@ -8,9 +8,12 @@ import time
 from uuid import UUID
 from fixtures.zenith_fixtures import ZenithEnvBuilder, assert_local, wait_until, wait_for_last_record_lsn, wait_for_upload
 from fixtures.log_helper import log
-from fixtures.utils import lsn_from_hex, lsn_to_hex
+from fixtures.utils import lsn_from_hex
 import pytest
 
+
+# def available_remote_storages():
+#     if os.getenv():
 
 #
 # Tests that a piece of data is backed up and restored correctly:
@@ -29,13 +32,13 @@ import pytest
 #   * queries the specific data, ensuring that it matches the one stored before
 #
 # The tests are done for all types of remote storage pageserver supports.
-@pytest.mark.parametrize('storage_type', ['local_fs', 'mock_s3'])
+@pytest.mark.parametrize('storage_type', ['local_fs', 's3'])
 def test_remote_storage_backup_and_restore(zenith_env_builder: ZenithEnvBuilder, storage_type: str):
     # zenith_env_builder.rust_log_override = 'debug'
     if storage_type == 'local_fs':
         zenith_env_builder.enable_local_fs_remote_storage()
-    elif storage_type == 'mock_s3':
-        zenith_env_builder.enable_s3_mock_remote_storage('test_remote_storage_backup_and_restore')
+    elif storage_type == 's3':
+        zenith_env_builder.enable_s3_remote_storage('test_remote_storage_backup_and_restore')
     else:
         raise RuntimeError(f'Unknown storage type: {storage_type}')
 
@@ -43,8 +46,12 @@ def test_remote_storage_backup_and_restore(zenith_env_builder: ZenithEnvBuilder,
     data_secret = 'very secret secret'
 
     ##### First start, insert secret data and upload it to the remote storage
-    env = zenith_env_builder.init_start()
-    pg = env.postgres.create_start('main')
+    try:
+        env = zenith_env_builder.init_start()
+        pg = env.postgres.create_start('main')
+    except Exception as e:
+        import ipdb; ipdb.set_trace()
+        raise e
 
     client = env.pageserver.http_client()
 

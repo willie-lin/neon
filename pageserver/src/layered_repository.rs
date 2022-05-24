@@ -1893,7 +1893,7 @@ impl LayeredTimeline {
 
                 let num_deltas = layers.count_deltas(&img_range, &(img_lsn..lsn))?;
 
-                debug!(
+                trace!(
                     "range {}-{}, has {} deltas on this timeline",
                     img_range.start, img_range.end, num_deltas
                 );

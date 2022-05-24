@@ -252,7 +252,7 @@ fn start_pageserver(conf: &'static PageServerConf, daemonize: bool) -> Result<()
         // it has spawned a child to prevent coverage machinery from
         // dumping stats into a `profraw` file now owned by the child.
         // Otherwise, the coverage data will be damaged.
-        match daemonize.exit_action(|| exit_now(0)).start() {
+        match daemonize.exit_action(|| exit_now(123)).start() {
             Ok(_) => info!("Success, daemonized"),
             Err(err) => error!(%err, "could not daemonize"),
         }

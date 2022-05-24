@@ -220,8 +220,12 @@ impl PageServerNode {
         let mut cmd = Command::new(self.env.pageserver_bin()?);
         let mut filled_cmd = fill_rust_env_vars(cmd.args(&args).arg("--daemonize"));
         filled_cmd = fill_aws_secrets_vars(filled_cmd);
+        
+        let mut pageserver_process = filled_cmd.spawn()?;
+        let status = pageserver_process.wait()?;
 
-        if !filled_cmd.status()?.success() {
+        if !status.success() {
+            // pageserver_process.stdout.take().
             bail!(
                 "Pageserver failed to start. See '{}' for details.",
                 self.repo_path().join("pageserver.log").display()

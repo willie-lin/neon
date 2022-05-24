@@ -51,7 +51,7 @@ def test_tenants_many(zenith_env_builder: ZenithEnvBuilder, storage_type: str):
     if storage_type == 'local_fs':
         zenith_env_builder.enable_local_fs_remote_storage()
     elif storage_type == 'mock_s3':
-        zenith_env_builder.enable_s3_mock_remote_storage('test_remote_storage_backup_and_restore')
+        zenith_env_builder.enable_s3_remote_storage('test_remote_storage_backup_and_restore')
     else:
         raise RuntimeError(f'Unknown storage type: {storage_type}')
 
