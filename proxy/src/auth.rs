@@ -9,7 +9,7 @@ pub use credentials::ClientCredentials;
 mod flow;
 pub use flow::*;
 
-use crate::{error::UserFacingError, waiters};
+use crate::error::UserFacingError;
 use std::io;
 use thiserror::Error;
 
@@ -19,17 +19,30 @@ pub type Result<T> = std::result::Result<T, AuthError>;
 /// Common authentication error.
 #[derive(Debug, Error)]
 pub enum AuthErrorImpl {
-    /// Authentication error reported by the console.
+    // This will be dropped in the future.
     #[error(transparent)]
-    Console(#[from] backend::AuthError),
+    Legacy(#[from] backend::LegacyAuthError),
 
     #[error(transparent)]
-    GetAuthInfo(#[from] backend::console::ConsoleAuthError),
+    Link(#[from] backend::LinkAuthError),
 
+    #[error(transparent)]
+    GetAuthInfo(#[from] backend::GetAuthInfoError),
+
+    #[error(transparent)]
+    WakeCompute(#[from] backend::WakeComputeError),
+
+    /// SASL protocol errors (includes [SCRAM](crate::scram)).
     #[error(transparent)]
     Sasl(#[from] crate::sasl::Error),
 
-    /// For passwords that couldn't be processed by [`backend::legacy_console::parse_password`].
+    /// Happens whenever we couldn't extract the project (aka cluster) name.
+    #[error(transparent)]
+    BadProjectName(#[from] credentials::ProjectNameError),
+
+    #[error("Unsupported authentication method: {0}")]
+    BadAuthMethod(String),
+
     #[error("Malformed password message")]
     MalformedPassword,
 
@@ -38,27 +51,15 @@ pub enum AuthErrorImpl {
     Io(#[from] io::Error),
 }
 
-impl AuthErrorImpl {
-    pub fn auth_failed(msg: impl Into<String>) -> Self {
-        Self::Console(backend::AuthError::auth_failed(msg))
-    }
-}
-
-impl From<waiters::RegisterError> for AuthErrorImpl {
-    fn from(e: waiters::RegisterError) -> Self {
-        Self::Console(backend::AuthError::from(e))
-    }
-}
-
-impl From<waiters::WaitError> for AuthErrorImpl {
-    fn from(e: waiters::WaitError) -> Self {
-        Self::Console(backend::AuthError::from(e))
-    }
-}
-
 #[derive(Debug, Error)]
 #[error(transparent)]
 pub struct AuthError(Box<AuthErrorImpl>);
+
+impl AuthError {
+    pub fn bad_auth_method(name: impl Into<String>) -> Self {
+        AuthErrorImpl::BadAuthMethod(name.into()).into()
+    }
+}
 
 impl<T> From<T> for AuthError
 where
@@ -73,11 +74,18 @@ impl UserFacingError for AuthError {
     fn to_string_client(&self) -> String {
         use AuthErrorImpl::*;
         match self.0.as_ref() {
-            Console(e) => e.to_string_client(),
-            GetAuthInfo(e) => e.to_string_client(),
+            Legacy(e) => e.to_string_client(),
+            Link(e) => e.to_string_client(),
             Sasl(e) => e.to_string_client(),
+            BadProjectName(e) => e.to_string_client(),
+            BadAuthMethod(_) => self.to_string(),
             MalformedPassword => self.to_string(),
             _ => "Internal error".to_string(),
         }
     }
+}
+
+/// Upcast (almost) any error into an opaque [`io::Error`].
+fn io_error(e: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> io::Error {
+    io::Error::new(io::ErrorKind::Other, e)
 }
